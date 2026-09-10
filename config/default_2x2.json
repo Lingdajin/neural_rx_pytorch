@@ -1,0 +1,31 @@
+{
+  "model": {
+    "num_rx_antennas": 2,
+    "num_layers": 2,
+    "max_bits_per_symbol": 10,
+    "hidden_channels": 64,
+    "condition_channels": 16,
+    "num_iterations": 6,
+    "max_num_rbs": 275
+  },
+  "training": {
+    "epochs": 50,
+    "batch_size": 16,
+    "num_workers": 4,
+    "learning_rate": 0.0005,
+    "weight_decay": 0.0001,
+    "gradient_clip_norm": 1.0,
+    "early_stop_patience": 10,
+    "amp": true,
+    "seed": 42
+  },
+  "split": {
+    "train": 0.8,
+    "validation": 0.1,
+    "test": 0.1
+  },
+  "loss": {
+    "bit_weight": 1.0,
+    "symbol_weight": 0.2
+  }
+}

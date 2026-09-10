@@ -1,0 +1,142 @@
+{
+  "status": "WARN",
+  "dataset_samples": 80,
+  "inspected_samples": 80,
+  "shards": 8,
+  "has_traditional_eq": true,
+  "scenarios": [
+    {
+      "mcs_index": 13,
+      "qm": 4,
+      "num_rbs": 25,
+      "snr_db": 2.0,
+      "inspected_samples": 10
+    },
+    {
+      "mcs_index": 13,
+      "qm": 4,
+      "num_rbs": 25,
+      "snr_db": 4.0,
+      "inspected_samples": 10
+    },
+    {
+      "mcs_index": 13,
+      "qm": 4,
+      "num_rbs": 25,
+      "snr_db": 6.0,
+      "inspected_samples": 10
+    },
+    {
+      "mcs_index": 13,
+      "qm": 4,
+      "num_rbs": 25,
+      "snr_db": 8.0,
+      "inspected_samples": 10
+    },
+    {
+      "mcs_index": 13,
+      "qm": 4,
+      "num_rbs": 25,
+      "snr_db": 10.0,
+      "inspected_samples": 10
+    },
+    {
+      "mcs_index": 13,
+      "qm": 4,
+      "num_rbs": 25,
+      "snr_db": 12.0,
+      "inspected_samples": 10
+    },
+    {
+      "mcs_index": 13,
+      "qm": 4,
+      "num_rbs": 25,
+      "snr_db": 14.0,
+      "inspected_samples": 10
+    },
+    {
+      "mcs_index": 13,
+      "qm": 4,
+      "num_rbs": 25,
+      "snr_db": 16.0,
+      "inspected_samples": 10
+    }
+  ],
+  "valid_re_fraction": 0.8571428571428571,
+  "active_bit_count": 2304000,
+  "bit_zero_count": 1151139,
+  "bit_one_count": 1152861,
+  "bit_one_fraction": 0.5003736979166666,
+  "reference_symbol_rms": 0.9999159902397646,
+  "constellation_mapping": {
+    "4": {
+      "observed_bit_labels": 16,
+      "expected_bit_labels": 16,
+      "observed_points": 16,
+      "ambiguous_bit_labels": 0,
+      "ambiguous_points": 0
+    }
+  },
+  "traditional_evm_percent": 58.9136636092076,
+  "mean_declared_noise_var": 0.20834597572684288,
+  "mean_reconstruction_residual_power": 0.49401537485862024,
+  "reconstructed_signal_to_residual_db": 9.518406461331539,
+  "reconstruction_by_snr": [
+    {
+      "snr_db": 2.0,
+      "reconstructed_signal_to_residual_db": 5.001538030709975
+    },
+    {
+      "snr_db": 4.0,
+      "reconstructed_signal_to_residual_db": 7.440189412729016
+    },
+    {
+      "snr_db": 6.0,
+      "reconstructed_signal_to_residual_db": 9.002394703378325
+    },
+    {
+      "snr_db": 8.0,
+      "reconstructed_signal_to_residual_db": 11.920281626454244
+    },
+    {
+      "snr_db": 10.0,
+      "reconstructed_signal_to_residual_db": 11.388931518151963
+    },
+    {
+      "snr_db": 12.0,
+      "reconstructed_signal_to_residual_db": 12.708965873203653
+    },
+    {
+      "snr_db": 14.0,
+      "reconstructed_signal_to_residual_db": 16.893895595573017
+    },
+    {
+      "snr_db": 16.0,
+      "reconstructed_signal_to_residual_db": 17.55046423478013
+    }
+  ],
+  "value_ranges": {
+    "rx_grid": [
+      -8.548715591430664,
+      8.30483627319336
+    ],
+    "channel_est": [
+      -5.285816192626953,
+      4.750633716583252
+    ],
+    "tx_symbols": [
+      -0.9486833214759827,
+      0.9486833214759827
+    ],
+    "coded_bits": [
+      0.0,
+      1.0
+    ]
+  },
+  "errors": [],
+  "warnings": [
+    "Only one MCS is present; this dataset cannot validate multi-MCS adaptation",
+    "Only one RB allocation is present; this dataset cannot validate variable-RB adaptation",
+    "Fewer than 1000 samples are present; use this capture for pipeline checks, not final performance claims"
+  ]
+}
