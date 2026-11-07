@@ -6,3 +6,4 @@ results/
 dataset_h5/
 dataset_h5_new/
 .idea/
+dataset_test/*.h5
