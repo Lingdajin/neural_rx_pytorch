@@ -46,7 +46,8 @@ def main() -> None:
     device = torch.device(args.device)
     config = load_config(args.config)
     dataset = MatlabH5Dataset(
-        args.data, max_bits_per_symbol=int(config["model"]["max_bits_per_symbol"])
+        args.data, max_bits_per_symbol=int(config["model"]["max_bits_per_symbol"]),
+        load_traditional_eq=True,
     )
     indices = load_splits(args.splits, dataset)[args.split]
     loader = DataLoader(
@@ -69,12 +70,11 @@ def main() -> None:
         for batch in loader:
             batch = move_to_device(batch, device)
             outputs = model(*(batch[name] for name in MODEL_INPUTS))
-            losses = criterion(outputs, batch)
             for sample in range(batch["rx_grid"].shape[0]):
                 selection = slice(sample, sample + 1)
                 sample_batch = {name: value[selection] for name, value in batch.items()}
                 sample_output = {name: value[selection] for name, value in outputs.items()}
-                baseline = sample_batch.get("traditional_eq", sample_output["lmmse_symbols"])
+                baseline = sample_batch.get("traditional_eq")
                 sample_losses = criterion(sample_output, sample_batch)
                 snr_db = (
                     float(sample_batch["snr_db"][0]) if "snr_db" in sample_batch else None
@@ -112,7 +112,7 @@ def main() -> None:
         "samples": len(indices),
         "checkpoint_epoch": int(checkpoint["epoch"]),
         "metrics": overall.compute(),
-        "evm_baseline": "traditional_eq from dataset, otherwise LMMSE(channel_est, noise_var)",
+        "evm_baseline": "traditional_eq from dataset" if dataset.has_traditional_eq else None,
     }
     (output_dir / "summary.json").write_text(
         json.dumps(summary, indent=2), encoding="utf-8"

@@ -8,51 +8,6 @@ import torch
 from torch import Tensor, nn
 
 
-def _as_complex(value: Tensor) -> Tensor:
-    if value.shape[-1] != 2:
-        raise ValueError("Complex tensors must use a final [real, imag] dimension.")
-    return torch.view_as_complex(value.contiguous())
-
-
-def _as_real(value: Tensor) -> Tensor:
-    return torch.view_as_real(value)
-
-
-def lmmse_equalize(
-    rx_grid: Tensor,
-    channel_est: Tensor,
-    noise_var: Tensor,
-    valid_re_mask: Tensor | None = None,
-) -> Tensor:
-    """Return LMMSE symbols as ``[B, S, K, L, 2]``.
-
-    ``rx_grid`` is ``[B,S,K,R,2]`` and ``channel_est`` is
-    ``[B,S,K,R,L,2]``. ``noise_var`` is the complex noise power per RE.
-    """
-
-    # Complex half-precision linear solves are not portable across CUDA builds.
-    y = _as_complex(rx_grid.float())
-    h = _as_complex(channel_est.float())
-    batch, symbols, subcarriers, num_rx, num_layers = h.shape
-    if y.shape != (batch, symbols, subcarriers, num_rx):
-        raise ValueError("rx_grid and channel_est dimensions are inconsistent.")
-
-    h_flat = h.reshape(-1, num_rx, num_layers)
-    y_flat = y.reshape(-1, num_rx, 1)
-    n0 = noise_var.clamp_min(1e-8)[:, None, None].expand(
-        batch, symbols, subcarriers
-    ).reshape(-1)
-    gram = h_flat.mH @ h_flat
-    eye = torch.eye(num_layers, dtype=gram.dtype, device=gram.device)
-    regularized = gram + n0[:, None, None].to(gram.dtype) * eye
-    rhs = h_flat.mH @ y_flat
-    estimate = torch.linalg.solve(regularized, rhs).squeeze(-1)
-    estimate = estimate.reshape(batch, symbols, subcarriers, num_layers)
-    if valid_re_mask is not None:
-        estimate = estimate * valid_re_mask[..., None].to(estimate.dtype)
-    return _as_real(estimate)
-
-
 class SeparableConv2d(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3):
         super().__init__()
@@ -121,10 +76,13 @@ class ReceiverIteration(nn.Module):
 class NeuralPDSCHReceiver(nn.Module):
     """Fully convolutional receiver shared across MCS and RB allocations.
 
-    The physical prior is an LMMSE estimate. A graph-convolutional network then
-    exchanges information between layers and predicts a symbol correction plus
-    coded-bit logits. Positive bit logits mean bit one.
+    Uses received IQ, masks, noise power and scheduling conditions, without
+    channel estimates or a classical equalizer. Layer identities break the
+    symmetry of shared graph blocks. Symbols are predicted directly in the
+    transmitter's QAM scale. Positive bit logits mean bit one.
     """
+
+    architecture = "pdsch_no_csi_v1"
 
     def __init__(
         self,
@@ -150,12 +108,12 @@ class NeuralPDSCHReceiver(nn.Module):
             nn.Linear(condition_channels, condition_channels),
             nn.SiLU(),
         )
-        # Per layer: all RX samples, that layer's channel, LMMSE symbol,
-        # RE mask, log noise, and the MCS/RB condition.
+        self.register_buffer("layer_identity", torch.eye(num_layers))
+        # Per layer: all RX samples, one-hot layer identity, RE mask,
+        # log noise, and the MCS/RB condition. The identity is not channel CSI.
         evidence_channels = (
             2 * num_rx_antennas
-            + 2 * num_rx_antennas
-            + 2
+            + num_layers
             + 1
             + 1
             + condition_channels
@@ -179,21 +137,21 @@ class NeuralPDSCHReceiver(nn.Module):
         return cls(**config)
 
     def _normalize(
-        self, rx_grid: Tensor, channel_est: Tensor, noise_var: Tensor, mask: Tensor
-    ) -> tuple[Tensor, Tensor, Tensor]:
+        self, rx_grid: Tensor, noise_var: Tensor, mask: Tensor
+    ) -> tuple[Tensor, Tensor]:
+        rx_grid = rx_grid.float()
+        noise_var = noise_var.float()
         re_mask = mask.any(dim=-1).to(rx_grid.dtype)
         power = rx_grid.square().sum(dim=-1).mean(dim=-1)
         denom = re_mask.sum(dim=(1, 2)).clamp_min(1.0)
         rms = ((power * re_mask).sum(dim=(1, 2)) / denom).clamp_min(1e-8).sqrt()
         rx_grid = rx_grid / rms[:, None, None, None, None]
-        channel_est = channel_est / rms[:, None, None, None, None, None]
         noise_var = noise_var / rms.square()
-        return rx_grid, channel_est, noise_var
+        return rx_grid, noise_var
 
     def forward(
         self,
         rx_grid: Tensor,
-        channel_est: Tensor,
         noise_var: Tensor,
         data_mask: Tensor,
         qm: Tensor,
@@ -202,11 +160,8 @@ class NeuralPDSCHReceiver(nn.Module):
     ) -> dict[str, Tensor]:
         if data_mask.shape[-1] != self.num_layers:
             raise ValueError("data_mask must have one mask plane per layer.")
-        rx_grid, channel_est, normalized_n0 = self._normalize(
-            rx_grid, channel_est, noise_var, data_mask
-        )
-        lmmse = lmmse_equalize(
-            rx_grid, channel_est, normalized_n0, data_mask.any(dim=-1)
+        rx_grid, normalized_n0 = self._normalize(
+            rx_grid, noise_var, data_mask
         )
         batch, symbols, subcarriers, _, _ = rx_grid.shape
 
@@ -214,14 +169,9 @@ class NeuralPDSCHReceiver(nn.Module):
             batch, 2 * self.num_rx_antennas, symbols, subcarriers
         )
         rx_features = rx_features[:, None].expand(-1, self.num_layers, -1, -1, -1)
-        h_features = channel_est.permute(0, 4, 3, 5, 1, 2).reshape(
-            batch,
-            self.num_layers,
-            2 * self.num_rx_antennas,
-            symbols,
-            subcarriers,
+        layer_features = self.layer_identity.to(rx_features.dtype)[None, :, :, None, None].expand(
+            batch, -1, -1, symbols, subcarriers
         )
-        x_features = lmmse.permute(0, 3, 4, 1, 2)
         mask_features = data_mask.permute(0, 3, 1, 2)[:, :, None].to(rx_grid.dtype)
         log_n0 = normalized_n0.clamp_min(1e-8).log().clamp(-20.0, 10.0)
         log_n0 = log_n0[:, None, None, None, None].expand(
@@ -239,7 +189,7 @@ class NeuralPDSCHReceiver(nn.Module):
             -1, self.num_layers, -1, symbols, subcarriers
         )
         evidence = torch.cat(
-            (rx_features, h_features, x_features, mask_features, log_n0, conditions),
+            (rx_features, layer_features, mask_features, log_n0, conditions),
             dim=2,
         )
         flat_evidence = evidence.reshape(
@@ -255,9 +205,9 @@ class NeuralPDSCHReceiver(nn.Module):
         symbol_output = self.symbol_head(flat_state).reshape(
             batch, self.num_layers, 3, symbols, subcarriers
         )
-        correction = symbol_output[:, :, :2].permute(0, 3, 4, 1, 2)
+        symbols_predicted = symbol_output[:, :, :2].permute(0, 3, 4, 1, 2)
         log_symbol_var = symbol_output[:, :, 2].permute(0, 2, 3, 1).clamp(-10.0, 6.0)
-        equalized = lmmse + correction * data_mask[..., None].to(correction.dtype)
+        equalized = symbols_predicted * data_mask[..., None].to(symbols_predicted.dtype)
         bit_logits = self.bit_head(flat_state).reshape(
             batch,
             self.num_layers,
@@ -270,5 +220,4 @@ class NeuralPDSCHReceiver(nn.Module):
             "equalized_symbols": equalized,
             "bit_logits": bit_logits,
             "log_symbol_var": log_symbol_var,
-            "lmmse_symbols": lmmse,
         }

@@ -12,7 +12,6 @@ from .metrics import ReceiverMetricAccumulator
 
 MODEL_INPUTS = (
     "rx_grid",
-    "channel_est",
     "noise_var",
     "data_mask",
     "qm",
@@ -63,6 +62,6 @@ def run_epoch(
                     torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
                     optimizer.step()
             with torch.no_grad():
-                baseline = batch.get("traditional_eq", outputs["lmmse_symbols"])
+                baseline = batch.get("traditional_eq")
                 accumulator.update(losses, outputs, batch, baseline)
     return accumulator.compute()

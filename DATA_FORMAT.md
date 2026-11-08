@@ -14,11 +14,11 @@ axes automatically.
 | Dataset | Shape | Type | Meaning |
 | --- | --- | --- | --- |
 | `rx_grid` | `[N,S,K,2,2]` | `single` | Received grid; last axes are RX antenna and `[real,imag]` |
-| `channel_est` | `[N,S,K,2,2,2]` | `single` | Effective channel `H(rx,layer)` and `[real,imag]` |
+| `channel_est` | `[N,S,K,2,2,2]` | `single` | Legacy field, ignored by the current loader and receiver |
 | `data_mask` | `[N,S,K,2]` | `uint8` | One on PDSCH data REs for each layer; zero on DM-RS/PTRS/padding |
 | `tx_symbols` | `[N,S,K,2,2]` | `single` | Transmitted layer-mapped QAM symbols and `[real,imag]` |
 | `coded_bits` | `[N,S,K,2,Qmax]` | `single` | Rate-matched/scrambled bits in mapper order, padded with zeros |
-| `traditional_eq` | `[N,S,K,2,2]` | `single` | Optional traditional receiver symbols and `[real,imag]` |
+| `traditional_eq` | `[N,S,K,2,2]` | `single` | Optional offline evaluation baseline; never read in training |
 | `mcs_index` | `[N]` | integer | 3GPP MCS index (metadata/metric grouping) |
 | `qm` | `[N]` | integer | Bits per QAM symbol: 2, 4, 6, 8, or 10 |
 | `code_rate` | `[N]` | `single` | Target code rate in `[0,1]`, not the integer scaled by 1024 |
@@ -41,12 +41,21 @@ PDSCH receive chain. The model output uses the convention **positive LLR/logit
 means bit 1**; negate it if the downstream MATLAB decoder expects positive for
 bit 0.
 
-`channel_est` should come from the same DM-RS estimator and interpolation used
-at deployment. Training on perfect channel values and deploying with LS/MMSE
-estimates creates a substantial distribution mismatch. `traditional_eq`, when
-present, should contain the actual conventional receiver output on the same
-data RE ordering. Otherwise the scripts compare against an internal LMMSE
-equalizer based on `channel_est` and `noise_var`.
+The current model does not require or read `channel_est`. Existing shards need
+no conversion: the field may remain on disk. `traditional_eq`, when present,
+should contain the conventional receiver output in the same data RE ordering.
+Only evaluation/export/audit explicitly request it. Without it there is no
+traditional EVM or constellation; no LMMSE fallback is computed.
+
+Training reads `rx_grid`, `data_mask`, `tx_symbols`, `coded_bits`, the five required
+metadata vectors, and optional `snr_db` for stratification/reporting. Inference
+does not read targets. Metadata and shape information are inspected at startup;
+large arrays are loaded sample by sample.
+
+Preserve received pilot REs in `rx_grid`, even where `data_mask=0`. The mask
+selects data targets, not which received REs the CNN may observe. This format
+does not supply a known transmitted DM-RS grid or a dedicated pilot mask; blind
+phase/layer ambiguity remains a limitation for unknown changing channels.
 
 ## Collection recommendations
 

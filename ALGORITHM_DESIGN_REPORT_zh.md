@@ -1,5 +1,8 @@
 # 基于 PyTorch 的 2×2 MIMO PDSCH 神经接收机算法详细设计报告
 
+> 历史版本说明：本文保留原 CSI + LMMSE 结构的设计记录。当前代码已去除信道估计输入和 LMMSE，
+> 新结构与训练要求以 [NO_CSI_ANALYSIS_zh.md](NO_CSI_ANALYSIS_zh.md)、README 和 DATA_FORMAT 为准。
+
 ## 0. 文档范围与实现基线
 
 本文档针对当前仓库中的 PyTorch 实现编写，描述 `neural_rx_pytorch/model.py`、`data.py`、`losses.py`、`engine.py` 以及 `train.py`、`infer.py` 的实际算法和数据流。系统面向 **2 根接收天线、2 个空间层的 PDSCH**，输入是 OFDM 解调后的频域资源栅格、部署侧信道估计和噪声方差，输出是每个数据资源单元（RE）的均衡 QAM 符号及 coded bit 软信息。

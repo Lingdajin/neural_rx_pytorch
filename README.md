@@ -7,13 +7,17 @@ contains a fully convolutional PyTorch receiver trained from MATLAB link-level
 captures. One checkpoint supports variable MCS and RB allocations by using
 `Qm`, code rate, and RB count as conditioning inputs and masking padded REs.
 
-The model starts from a differentiable 2x2 LMMSE estimate, exchanges messages
-between the two spatial layers through iterative convolutional graph blocks,
-and predicts:
+The model uses received IQ, noise variance, data masks and scheduling conditions
+without channel estimates or LMMSE. Fixed one-hot layer identities distinguish
+the two streams in the shared iterative graph blocks. It directly predicts:
 
 - neural equalized constellation symbols;
-- coded-bit logits for up to 1024-QAM (`Qm <= 10`);
-- an internal LMMSE constellation for baseline comparison.
+- coded-bit logits for up to 1024-QAM (`Qm <= 10`).
+
+Legacy checkpoints are incompatible: train from scratch in a new directory.
+Legacy HDF5 files remain usable; training never reads `channel_est` or
+`traditional_eq`. See [the architecture and training analysis](NO_CSI_ANALYSIS_zh.md).
+Keep received pilot REs in `rx_grid`; the data mask limits supervision and outputs.
 
 This is a structural CGNN migration (state initialization, inter-layer graph
 aggregation, iterative convolutional updates, and readout heads), adapted to
@@ -53,22 +57,23 @@ need to fit in RAM.
 Run commands from `neural_rx_pytorch/`:
 
 ```bash
-python train.py --data data/*.h5 --output-dir runs/pdsch_2x2 --device cuda
+python train.py --data dataset_h5 --output-dir runs/no_csi --device cuda
 ```
 
 Override common settings without editing JSON:
 
 ```bash
-python train.py --data data --output-dir runs/pdsch_2x2 \
+python train.py --data dataset_h5 --output-dir runs/no_csi \
   --epochs 80 --batch-size 24 --num-workers 8
 ```
 
 Outputs include `best.pt`, `last.pt`, `history.csv`, `loss.png`, `config.json`,
-and `splits.npz`. Resume with:
+and `splits.npz`. Without CLI overrides, training reads `dataset_h5` and writes
+`runs/no_csi`. Only checkpoints from the current architecture can resume. Resume with:
 
 ```bash
-python train.py --data data --output-dir runs/pdsch_2x2 \
-  --resume runs/pdsch_2x2/last.pt
+python train.py --data dataset_h5 --output-dir runs/no_csi \
+  --resume runs/no_csi/last.pt
 ```
 
 Do not change or reorder the dataset shards when resuming or evaluating: the
@@ -77,21 +82,21 @@ saved split file contains a dataset fingerprint and rejects a mismatch.
 ## Validate and test
 
 ```bash
-python validate.py --data data \
-  --checkpoint runs/pdsch_2x2/best.pt \
-  --splits runs/pdsch_2x2/splits.npz \
-  --config runs/pdsch_2x2/config.json \
+python validate.py --data dataset_h5 \
+  --checkpoint runs/no_csi/best.pt \
+  --splits runs/no_csi/splits.npz \
+  --config runs/no_csi/config.json \
   --split validation --output-dir results/validation
 
-python validate.py --data data \
-  --checkpoint runs/pdsch_2x2/best.pt \
-  --splits runs/pdsch_2x2/splits.npz \
-  --config runs/pdsch_2x2/config.json \
+python validate.py --data dataset_h5 \
+  --checkpoint runs/no_csi/best.pt \
+  --splits runs/no_csi/splits.npz \
+  --config runs/no_csi/config.json \
   --split test --output-dir results/test
 ```
 
 `summary.json` contains aggregate loss, coded-bit BER, neural EVM, and
-traditional EVM. `metrics_by_mcs_rb.csv` gives MCS/RB/SNR breakdowns when the
+traditional EVM when stored `traditional_eq` is available. `metrics_by_mcs_rb.csv` gives MCS/RB/SNR breakdowns when the
 optional `snr_db` metadata is available.
 Post-LDPC BLER should be measured by passing the logits through the MATLAB
 decoder; coded BER alone is not a substitute for BLER.
@@ -99,17 +104,17 @@ decoder; coded BER alone is not a substitute for BLER.
 ## Export constellation points
 
 ```bash
-python export_constellation.py --data data \
-  --checkpoint runs/pdsch_2x2/best.pt \
-  --splits runs/pdsch_2x2/splits.npz \
-  --config runs/pdsch_2x2/config.json \
+python export_constellation.py --data dataset_h5 \
+  --checkpoint runs/no_csi/best.pt \
+  --splits runs/no_csi/splits.npz \
+  --config runs/no_csi/config.json \
   --split test --output results/constellation.mat
 ```
 
 The `.mat` and `.npz` outputs contain reference, neural, and traditional
 complex points plus EVM values and MCS/RB/layer metadata. If the source file
-has `traditional_eq`, it is used; otherwise the comparison is the internal
-LMMSE result.
+has `traditional_eq`, it is used only as an offline comparison; otherwise the
+traditional points and EVM are omitted. No internal LMMSE is computed.
 
 ## Call from MATLAB
 
@@ -125,7 +130,7 @@ Before deployment, evaluate held-out channels for every supported MCS and RB:
 
 1. coded-bit BCE/BER and pre-decoder EVM;
 2. post-LDPC BER/BLER and CRC in MATLAB;
-3. traditional receiver and neural receiver using the same channel/noise
-   estimates;
+3. traditional and neural receivers using identical received samples (only
+   the traditional receiver consumes channel estimates);
 4. unseen SNR, Doppler, delay profiles, and RF impairments;
 5. runtime and memory at the maximum RB allocation.

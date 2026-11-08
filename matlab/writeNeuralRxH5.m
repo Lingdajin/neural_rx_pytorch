@@ -3,11 +3,12 @@ function writeNeuralRxH5(filename, data)
 %
 % Required fields (logical MATLAB dimensions):
 %   rxGrid       [N,S,K,2] complex
-%   channelEst   [N,S,K,2,2] complex, H(rx,layer)
 %   dataMask     [N,S,K,2] logical
 %   mcsIndex     [N,1], qm [N,1], codeRate [N,1]
 %   numRBs       [N,1], noiseVar [N,1]
 % Optional metadata: snrDb [N,1]
+% Legacy diagnostic field (not read by the neural receiver):
+%   channelEst   [N,S,K,2,2] complex, H(rx,layer)
 % Training files additionally require:
 %   txSymbols    [N,S,K,2] complex
 %   codedBits    [N,S,K,2,Qmax] single (0/1; Qmax <= 10)
@@ -25,7 +26,9 @@ end
 writeReal(filename, '/rx_grid', complexToIQ(data.rxGrid));
 h5writeatt(filename, '/', 'axis_order', 'matlab');
 h5writeatt(filename, '/', 'format_version', int32(1));
-writeReal(filename, '/channel_est', complexToIQ(data.channelEst));
+if isfield(data, 'channelEst')
+    writeReal(filename, '/channel_est', complexToIQ(data.channelEst));
+end
 writeReal(filename, '/data_mask', uint8(data.dataMask));
 
 requiredMetadata = {'mcsIndex','qm','codeRate','numRBs','noiseVar'};

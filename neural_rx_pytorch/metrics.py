@@ -68,6 +68,7 @@ class ReceiverMetricAccumulator:
         self.neural_reference_power = 0.0
         self.traditional_error_power = 0.0
         self.traditional_reference_power = 0.0
+        self.traditional_samples = 0
 
     @property
     def count(self) -> int:
@@ -78,7 +79,7 @@ class ReceiverMetricAccumulator:
         losses: dict[str, Tensor],
         outputs: dict[str, Tensor],
         batch: dict[str, Tensor],
-        traditional: Tensor,
+        traditional: Tensor | None = None,
     ) -> None:
         batch_size = int(batch["rx_grid"].shape[0])
         self.losses.update(
@@ -90,15 +91,17 @@ class ReceiverMetricAccumulator:
         neural_error, neural_reference = masked_evm_sums(
             outputs["equalized_symbols"], batch["tx_symbols"], batch["data_mask"]
         )
-        traditional_error, traditional_reference = masked_evm_sums(
-            traditional, batch["tx_symbols"], batch["data_mask"]
-        )
         self.bit_errors += float(errors)
         self.bit_count += float(bits)
         self.neural_error_power += float(neural_error)
         self.neural_reference_power += float(neural_reference)
-        self.traditional_error_power += float(traditional_error)
-        self.traditional_reference_power += float(traditional_reference)
+        if traditional is not None:
+            traditional_error, traditional_reference = masked_evm_sums(
+                traditional, batch["tx_symbols"], batch["data_mask"]
+            )
+            self.traditional_error_power += float(traditional_error)
+            self.traditional_reference_power += float(traditional_reference)
+            self.traditional_samples += batch_size
 
     def compute(self) -> dict[str, float]:
         result = self.losses.compute()
@@ -106,8 +109,9 @@ class ReceiverMetricAccumulator:
         result["neural_evm"] = (
             self.neural_error_power / max(1e-12, self.neural_reference_power)
         ) ** 0.5
-        result["traditional_evm"] = (
-            self.traditional_error_power
-            / max(1e-12, self.traditional_reference_power)
-        ) ** 0.5
+        if self.traditional_samples:
+            result["traditional_evm"] = (
+                self.traditional_error_power
+                / max(1e-12, self.traditional_reference_power)
+            ) ** 0.5
         return result

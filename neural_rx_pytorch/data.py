@@ -17,7 +17,6 @@ from torch.utils.data import Dataset
 
 ARRAY_FIELDS = {
     "rx_grid": 5,
-    "channel_est": 6,
     "data_mask": 4,
     "tx_symbols": 5,
     "coded_bits": 5,
@@ -76,6 +75,8 @@ class MatlabH5Dataset(Dataset[dict[str, Tensor]]):
     Files with ``axis_order=matlab`` store the sample dimension physically last;
     files with ``axis_order=python`` store it first. Returned arrays always use
     the logical sample-first convention documented in ``DATA_FORMAT.md``.
+    ``channel_est`` is never opened. ``traditional_eq`` is read only when
+    explicitly requested for offline evaluation; training defaults to skipping it.
     """
 
     def __init__(
@@ -83,6 +84,7 @@ class MatlabH5Dataset(Dataset[dict[str, Tensor]]):
         paths: str | Path | Iterable[str | Path],
         max_bits_per_symbol: int = 10,
         require_targets: bool = True,
+        load_traditional_eq: bool = False,
     ) -> None:
         self.paths = resolve_h5_paths(paths)
         self.max_bits_per_symbol = max_bits_per_symbol
@@ -103,7 +105,7 @@ class MatlabH5Dataset(Dataset[dict[str, Tensor]]):
                 axis_order = _text_attr(handle.attrs.get("axis_order", "matlab")).lower()
                 if axis_order not in {"matlab", "python"}:
                     raise ValueError(f"{path}: axis_order must be 'matlab' or 'python'.")
-                required = {"rx_grid", "channel_est", "data_mask", *METADATA_FIELDS}
+                required = {"rx_grid", "data_mask", *METADATA_FIELDS}
                 if require_targets:
                     required.update({"tx_symbols", "coded_bits"})
                 missing = sorted(required.difference(handle.keys()))
@@ -120,16 +122,6 @@ class MatlabH5Dataset(Dataset[dict[str, Tensor]]):
                 count, num_symbols, max_subcarriers, num_rx, iq = rx_shape
                 if num_rx != 2 or iq != 2:
                     raise ValueError(f"{path}: rx_grid must describe two RX antennas and IQ=2.")
-                channel_shape = _logical_shape(handle["channel_est"], axis_order)
-                if channel_shape != (
-                    count,
-                    num_symbols,
-                    max_subcarriers,
-                    2,
-                    2,
-                    2,
-                ):
-                    raise ValueError(f"{path}: channel_est has invalid logical shape {channel_shape}.")
                 mask_shape = _logical_shape(handle["data_mask"], axis_order)
                 if mask_shape != (count, num_symbols, max_subcarriers, 2):
                     raise ValueError(f"{path}: data_mask has invalid logical shape {mask_shape}.")
@@ -162,7 +154,7 @@ class MatlabH5Dataset(Dataset[dict[str, Tensor]]):
                         if len(values) != count:
                             raise ValueError(f"{path}:{name} must contain one value per sample.")
                         optional_metadata[name].append(values)
-                traditional_flags.append("traditional_eq" in handle)
+                traditional_flags.append(load_traditional_eq and "traditional_eq" in handle)
                 self.shards.append(
                     ShardInfo(path, count, axis_order, num_symbols, max_subcarriers)
                 )
@@ -234,7 +226,7 @@ class MatlabH5Dataset(Dataset[dict[str, Tensor]]):
         num_subcarriers = int(self.metadata["num_rbs"][index]) * 12
 
         result: dict[str, Tensor] = {}
-        names = ["rx_grid", "channel_est", "data_mask"]
+        names = ["rx_grid", "data_mask"]
         if self.require_targets:
             names.extend(("tx_symbols", "coded_bits"))
         if self.has_traditional_eq:

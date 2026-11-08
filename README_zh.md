@@ -1,5 +1,9 @@
 # PyTorch 版 2x2 MIMO PDSCH 神经接收机
 
+当前版本已去除 `channel_est` 输入和内部 LMMSE，直接预测发送符号与 bit logits，
+并通过固定层标识区分两条空间流。原版检查点不能续训，必须在新目录重新训练。
+结构变化、性能限制和训练建议见 [NO_CSI_ANALYSIS_zh.md](NO_CSI_ANALYSIS_zh.md)。
+
 本目录是独立于原 TensorFlow/Sionna PUSCH 运行环境的新实现。模型保留了
 CGNN 的主要结构：状态初始化、层间消息聚合、多轮卷积状态更新和读出头，
 并针对 MATLAB 采集的 PDSCH 数据改为监督训练。原 TensorFlow 权重不能直接
@@ -29,11 +33,10 @@ pip install -r requirements.txt
 | 字段 | MATLAB 逻辑形状 | 说明 |
 | --- | --- | --- |
 | `rx_grid` | `[N,S,K,2,2]` | 两根接收天线的频域网格，末维为实部/虚部 |
-| `channel_est` | `[N,S,K,2,2,2]` | 部署接收机给出的有效信道 `H(rx,layer)` |
 | `data_mask` | `[N,S,K,2]` | PDSCH 数据 RE 为 1，导频/PTRS/补零为 0 |
 | `tx_symbols` | `[N,S,K,2,2]` | 层映射后的发送 QAM 符号 |
 | `coded_bits` | `[N,S,K,2,Qmax]` | 速率匹配和加扰后的 mapper 输入 bit |
-| `traditional_eq` | `[N,S,K,2,2]` | 可选，MATLAB 传统接收机均衡符号 |
+| `traditional_eq` | `[N,S,K,2,2]` | 可选，仅离线验证/星座对照读取，训练不读取 |
 
 每个样本还需提供 `mcs_index`、`qm`、`code_rate`、`num_rbs` 和
 `noise_var`；建议额外提供 `snr_db`。完整定义与 bit 顺序要求见
@@ -41,6 +44,8 @@ pip install -r requirements.txt
 [DATA_COLLECTION_GUIDE_zh.md](DATA_COLLECTION_GUIDE_zh.md)。
 特别注意：`coded_bits` 不是传输块原始 bit，
 必须与对应 `tx_symbols` 的 QAM mapper 输入逐 RE 对齐。
+旧文件中的 `channel_est` 可以保留，加载器不会读取或校验它。不要把
+`rx_grid` 中的导频 RE 清零；`data_mask=0` 只屏蔽监督损失和符号/bit 输出。
 
 ## 3. 训练与续训
 
@@ -53,7 +58,7 @@ python inspect_dataset.py --data dataset_h5 --output dataset_report.json
 只有报告状态为 `PASS` 或已确认 `WARN` 原因后再开始训练。
 
 ```bash
-python train.py --data data --output-dir runs/pdsch_2x2 --device cuda
+python train.py --data dataset_h5 --output-dir runs/no_csi --device cuda
 ```
 
 训练脚本按 `(MCS,RB)` 分层生成固定的 80%/10%/10% 训练、验证和测试集。如果
@@ -69,24 +74,28 @@ python train.py --data data --output-dir runs/pdsch_2x2 --device cuda
 
 续训命令：
 
+省略训练的 `--data` 时默认读取工程内的 `dataset_h5`，省略 `--output-dir`
+时默认输出到 `runs/no_csi`。已有检查点的目录必须显式 `--resume`。
+
 ```bash
-python train.py --data data --output-dir runs/pdsch_2x2 \
-  --config runs/pdsch_2x2/config.json \
-  --resume runs/pdsch_2x2/last.pt --device cuda
+python train.py --data dataset_h5 --output-dir runs/no_csi \
+  --config runs/no_csi/config.json \
+  --resume runs/no_csi/last.pt --device cuda
 ```
 
 ## 4. 验证和测试
 
 ```bash
-python validate.py --data data \
-  --checkpoint runs/pdsch_2x2/best.pt \
-  --splits runs/pdsch_2x2/splits.npz \
-  --config runs/pdsch_2x2/config.json \
+python validate.py --data dataset_h5 \
+  --checkpoint runs/no_csi/best.pt \
+  --splits runs/no_csi/splits.npz \
+  --config runs/no_csi/config.json \
   --split validation --output-dir results/validation
 ```
 
 将 `--split validation` 改成 `--split test` 可运行最终测试集。输出包含 coded
-BER、神经接收机 EVM、传统接收机 EVM，以及按 MCS/RB/SNR 的 CSV 明细。
+BER、神经接收机 EVM，以及按 MCS/RB/SNR 的 CSV 明细。
+只有数据集提供 `traditional_eq` 时才报告传统接收机 EVM。
 
 这里的 BER 是 LDPC 前的 coded BER。正式性能结论应将网络输出 LLR 接回已有
 MATLAB PDSCH 解扰、速率恢复、LDPC 和 CRC 流程，绘制各 MCS/RB/SNR 下的 BLER。
@@ -94,24 +103,23 @@ MATLAB PDSCH 解扰、速率恢复、LDPC 和 CRC 流程，绘制各 MCS/RB/SNR 
 ## 5. 导出 EVM/星座数据
 
 ```bash
-python export_constellation.py --data data \
-  --checkpoint runs/pdsch_2x2/best.pt \
-  --splits runs/pdsch_2x2/splits.npz \
-  --config runs/pdsch_2x2/config.json \
+python export_constellation.py --data dataset_h5 \
+  --checkpoint runs/no_csi/best.pt \
+  --splits runs/no_csi/splits.npz \
+  --config runs/no_csi/config.json \
   --split test --output results/constellation.mat
 ```
 
-输出 `.mat` 和 `.npz`，包含 `reference`、`neural`、`traditional` 三组复数星座
-点以及两种 EVM。数据中存在 `traditional_eq` 时优先使用真实 MATLAB 传统
-均衡结果；否则使用同一 `channel_est/noise_var` 计算的内部 LMMSE 基线。
+输出 `.mat` 和 `.npz`，包含 `reference`、`neural` 复数星座点和神经 EVM。
+数据中存在 `traditional_eq` 时额外导出 `traditional` 和传统 EVM；否则省略这些字段，
+不会重新计算 LMMSE。
 
 ## 6. MATLAB 调用
 
-运行 `matlab/exampleCallNeuralRx.m`。示例将 MATLAB 的频域网格、信道估计和
+运行 `matlab/exampleCallNeuralRx.m`。示例将 MATLAB 的频域网格、噪声方差和
 调度信息写入临时 HDF5，调用 `infer.py`，再读取：
 
 - `equalized_symbols`：神经接收机均衡星座；
-- `traditional_lmmse_symbols`：LMMSE 对照星座；
 - `bit_llr_positive_one`：软 bit，正值表示 bit 1；
 - `data_mask`：有效数据 RE 掩码。
 

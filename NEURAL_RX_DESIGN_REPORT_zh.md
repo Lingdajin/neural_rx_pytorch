@@ -1,5 +1,8 @@
 # 2×2 MIMO PDSCH 神经接收机方案设计报告
 
+> 历史版本说明：下文的结构、图表和已有实验产物对应原 CSI + LMMSE 模型，不能作为新模型的性能结果。
+> 当前实现与限制见 [NO_CSI_ANALYSIS_zh.md](NO_CSI_ANALYSIS_zh.md)。
+
 > 本文档面向当前仓库的 PyTorch 实现(`neural_rx_pytorch`),从**数据集产生**、
 > **神经接收机模型与训练**、**神经接收机展示**三个方面描述完整方案。
 > 所有数据图表均由仓库内真实运行产物(`runs/`、`results/`)绘制,

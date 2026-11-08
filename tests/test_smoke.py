@@ -15,6 +15,8 @@ import torch
 from torch.utils.data import DataLoader
 
 from neural_rx_pytorch.data import MatlabH5Dataset, padded_collate
+from neural_rx_pytorch.engine import MODEL_INPUTS, run_epoch
+from neural_rx_pytorch.checkpoint import check_model_architecture
 from neural_rx_pytorch.losses import ReceiverLoss
 from neural_rx_pytorch.metrics import masked_ber
 from neural_rx_pytorch.model import NeuralPDSCHReceiver
@@ -61,6 +63,59 @@ def create_dataset(path: Path, axis_order: str = "python") -> None:
 
 
 class ReceiverSmokeTest(unittest.TestCase):
+    def test_selective_loading_and_channel_free_backward(self) -> None:
+        for axis_order in ("python", "matlab"):
+            with self.subTest(axis_order=axis_order), tempfile.TemporaryDirectory() as temporary:
+                path = Path(temporary) / "legacy.h5"
+                create_dataset(path, axis_order)
+                with h5py.File(path, "a") as handle:
+                    # Deliberately invalid legacy fields must not even be read/validated.
+                    del handle["channel_est"]
+                    handle.create_dataset("channel_est", data=np.nan)
+                    handle.create_dataset("traditional_eq", data=np.nan)
+                read_names = []
+                original_read = h5py.Dataset.__getitem__
+
+                def tracked_read(dataset, key):
+                    read_names.append(dataset.name)
+                    return original_read(dataset, key)
+
+                with patch.object(h5py.Dataset, "__getitem__", tracked_read):
+                    dataset = MatlabH5Dataset(path, max_bits_per_symbol=4)
+                    try:
+                        batch = padded_collate([dataset[0], dataset[1]])
+                    finally:
+                        dataset.close()
+                self.assertNotIn("/channel_est", read_names)
+                self.assertNotIn("/traditional_eq", read_names)
+                self.assertNotIn("channel_est", batch)
+                self.assertNotIn("traditional_eq", batch)
+                model = NeuralPDSCHReceiver(
+                    hidden_channels=8, condition_channels=4, num_iterations=1,
+                    max_bits_per_symbol=4,
+                )
+                outputs = model(*(batch[name] for name in MODEL_INPUTS))
+                self.assertNotIn("lmmse_symbols", outputs)
+                # Identical masks must not force identical spatial streams.
+                self.assertFalse(torch.allclose(
+                    outputs["equalized_symbols"][..., 0, :],
+                    outputs["equalized_symbols"][..., 1, :],
+                ))
+                for name in ("equalized_symbols", "bit_logits"):
+                    self.assertTrue(torch.isfinite(outputs[name]).all())
+                    self.assertTrue((outputs[name][~batch["data_mask"]] == 0).all())
+                optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
+                before = model.symbol_head[-1].weight.detach().clone()
+                metrics = run_epoch(model, [batch], ReceiverLoss(), torch.device("cpu"), optimizer)
+                self.assertNotIn("traditional_evm", metrics)
+                self.assertTrue(np.isfinite(list(metrics.values())).all())
+                self.assertFalse(torch.equal(before, model.symbol_head[-1].weight))
+                batch["traditional_eq"] = batch["tx_symbols"].clone()
+                metrics = run_epoch(model, [batch], ReceiverLoss(), torch.device("cpu"))
+                self.assertEqual(metrics["traditional_evm"], 0.0)
+                with self.assertRaisesRegex(ValueError, "Train a new model"):
+                    check_model_architecture({"model_state": {}}, model)
+
     def test_ber_counter_does_not_overflow_float16(self) -> None:
         bit_count = 100_000
         bits = torch.zeros((1, 1, bit_count, 1, 1), dtype=torch.float32)
@@ -88,7 +143,7 @@ class ReceiverSmokeTest(unittest.TestCase):
                     max_num_rbs=2,
                 )
                 outputs = model(
-                    batch["rx_grid"], batch["channel_est"], batch["noise_var"],
+                    batch["rx_grid"], batch["noise_var"],
                     batch["data_mask"], batch["qm"], batch["code_rate"], batch["num_rbs"],
                 )
                 self.assertEqual(outputs["bit_logits"].shape, (4, 4, 24, 2, 4))
@@ -124,13 +179,19 @@ class ReceiverSmokeTest(unittest.TestCase):
                 for index in (0, 1, len(python_data) - 1):
                     left = python_data[index]
                     right = matlab_data[index]
-                    for name in ("rx_grid", "channel_est", "data_mask", "tx_symbols", "coded_bits"):
+                    for name in ("rx_grid", "data_mask", "tx_symbols", "coded_bits"):
                         torch.testing.assert_close(left[name], right[name])
             finally:
                 python_data.close()
                 matlab_data.close()
 
     def test_train_validate_export_and_infer_entrypoints(self) -> None:
+        self._check_entrypoints(with_baseline=False)
+
+    def test_entrypoints_with_stored_baseline(self) -> None:
+        self._check_entrypoints(with_baseline=True)
+
+    def _check_entrypoints(self, with_baseline: bool) -> None:
         import export_constellation
         import infer
         import train
@@ -142,6 +203,10 @@ class ReceiverSmokeTest(unittest.TestCase):
             config_path = root / "config.json"
             run_dir = root / "run"
             create_dataset(data_path)
+            with h5py.File(data_path, "a") as handle:
+                del handle["channel_est"]
+                if with_baseline:
+                    handle.create_dataset("traditional_eq", data=handle["tx_symbols"][()])
             config = {
                 "model": {
                     "num_rx_antennas": 2,
@@ -175,6 +240,11 @@ class ReceiverSmokeTest(unittest.TestCase):
                 train.main()
             self.assertTrue((run_dir / "best.pt").is_file())
             self.assertTrue((run_dir / "loss.png").is_file())
+            with patch.object(sys, "argv", train_args + ["--resume", str(run_dir / "last.pt"), "--epochs", "2"]):
+                train.main()
+            checkpoint = torch.load(run_dir / "last.pt", weights_only=False)
+            self.assertEqual(checkpoint["epoch"], 2)
+            self.assertNotIn("train_traditional_evm", checkpoint["history"][-1])
 
             validation_dir = root / "validation"
             validation_args = [
@@ -186,6 +256,10 @@ class ReceiverSmokeTest(unittest.TestCase):
             with patch.object(sys, "argv", validation_args):
                 validate.main()
             self.assertTrue((validation_dir / "summary.json").is_file())
+            summary = json.loads((validation_dir / "summary.json").read_text())
+            self.assertEqual("traditional_evm" in summary["metrics"], with_baseline)
+            if with_baseline:
+                self.assertEqual(summary["metrics"]["traditional_evm"], 0.0)
 
             constellation_path = root / "constellation.mat"
             export_args = [
@@ -197,10 +271,18 @@ class ReceiverSmokeTest(unittest.TestCase):
             with patch.object(sys, "argv", export_args):
                 export_constellation.main()
             self.assertTrue(constellation_path.is_file())
+            with np.load(constellation_path.with_suffix(".npz")) as exported:
+                self.assertEqual("traditional" in exported, with_baseline)
 
             inference_path = root / "inference.mat"
+            # Deployment inputs need neither CSI nor supervised targets.
+            input_path = root / "input.h5"
+            create_dataset(input_path)
+            with h5py.File(input_path, "a") as handle:
+                for name in ("channel_est", "tx_symbols", "coded_bits"):
+                    del handle[name]
             infer_args = [
-                "infer.py", "--input", str(data_path), "--checkpoint",
+                "infer.py", "--input", str(input_path), "--checkpoint",
                 str(run_dir / "best.pt"), "--config", str(run_dir / "config.json"),
                 "--output", str(inference_path), "--device", "cpu",
             ]

@@ -48,7 +48,8 @@ def main() -> None:
     device = torch.device(args.device)
     config = load_config(args.config)
     dataset = MatlabH5Dataset(
-        args.data, max_bits_per_symbol=int(config["model"]["max_bits_per_symbol"])
+        args.data, max_bits_per_symbol=int(config["model"]["max_bits_per_symbol"]),
+        load_traditional_eq=True,
     )
     indices = load_splits(args.splits, dataset)[args.split][: args.max_samples]
     loader = DataLoader(
@@ -57,25 +58,28 @@ def main() -> None:
     model = NeuralPDSCHReceiver.from_config(config["model"]).to(device)
     load_model_checkpoint(args.checkpoint, model, device)
     fields: dict[str, list[np.ndarray]] = {
-        "reference": [], "neural": [], "traditional": [], "mcs_index": [],
+        "reference": [], "neural": [], "mcs_index": [],
         "num_rbs": [], "layer": [], "sample_index": [],
     }
+    if dataset.has_traditional_eq:
+        fields["traditional"] = []
     model.eval()
     with torch.no_grad():
         for batch in loader:
             batch = move_to_device(batch, device)
             outputs = model(*(batch[name] for name in MODEL_INPUTS))
-            traditional = batch.get("traditional_eq", outputs["lmmse_symbols"])
+            traditional = batch.get("traditional_eq")
             mask = batch["data_mask"][0].cpu().numpy()
             reference = to_complex(batch["tx_symbols"])[0]
             neural = to_complex(outputs["equalized_symbols"])[0]
-            traditional_np = to_complex(traditional)[0]
+            traditional_np = to_complex(traditional)[0] if traditional is not None else None
             for layer in range(2):
                 selected = mask[..., layer]
                 count = int(selected.sum())
                 fields["reference"].append(reference[..., layer][selected])
                 fields["neural"].append(neural[..., layer][selected])
-                fields["traditional"].append(traditional_np[..., layer][selected])
+                if traditional_np is not None:
+                    fields["traditional"].append(traditional_np[..., layer][selected])
                 fields["mcs_index"].append(np.full(count, int(batch["mcs_index"][0]), np.int32))
                 fields["num_rbs"].append(np.full(count, int(batch["num_rbs"][0]), np.int32))
                 fields["layer"].append(np.full(count, layer + 1, np.int32))
@@ -87,9 +91,10 @@ def main() -> None:
     exported["neural_evm_percent"] = np.asarray(
         [100 * np.sqrt(np.sum(np.abs(exported["neural"] - exported["reference"]) ** 2) / ref_power)]
     )
-    exported["traditional_evm_percent"] = np.asarray(
-        [100 * np.sqrt(np.sum(np.abs(exported["traditional"] - exported["reference"]) ** 2) / ref_power)]
-    )
+    if "traditional" in exported:
+        exported["traditional_evm_percent"] = np.asarray(
+            [100 * np.sqrt(np.sum(np.abs(exported["traditional"] - exported["reference"]) ** 2) / ref_power)]
+        )
     output = Path(args.output).resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     savemat(output, exported, do_compression=True)
@@ -98,7 +103,9 @@ def main() -> None:
     print(json.dumps({
         "output": str(output), "points": len(exported["reference"]),
         "neural_evm_percent": float(exported["neural_evm_percent"][0]),
-        "traditional_evm_percent": float(exported["traditional_evm_percent"][0]),
+        "traditional_evm_percent": (
+            float(exported["traditional_evm_percent"][0]) if "traditional" in exported else None
+        ),
     }, indent=2))
 
 

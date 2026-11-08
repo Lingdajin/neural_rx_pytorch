@@ -38,7 +38,7 @@ def main() -> None:
     args = parse_args()
     config = json.loads(Path(args.config).read_text(encoding="utf-8"))
     max_bits = int(config["model"]["max_bits_per_symbol"])
-    dataset = MatlabH5Dataset(args.data, max_bits_per_symbol=max_bits)
+    dataset = MatlabH5Dataset(args.data, max_bits_per_symbol=max_bits, load_traditional_eq=True)
     if args.max_samples is None or args.max_samples >= len(dataset):
         indices = np.arange(len(dataset), dtype=np.int64)
     else:
@@ -56,11 +56,8 @@ def main() -> None:
     reference_energy = 0.0
     traditional_error_energy = 0.0
     traditional_reference_energy = 0.0
-    reconstruction_residual_energy = 0.0
-    reconstructed_signal_energy = 0.0
-    observed_rx_count = 0
-    noise_variance_sum = 0.0
-    reconstruction_by_snr: dict[float, list[float]] = defaultdict(lambda: [0.0, 0.0])
+    nondata_re_count = 0
+    nonzero_nondata_re_count = 0
     constellation_maps: dict[
         int, dict[tuple[int, ...], set[tuple[float, float]]]
     ] = defaultdict(lambda: defaultdict(set))
@@ -88,7 +85,7 @@ def main() -> None:
 
             arrays = {
                 name: sample[name].numpy()
-                for name in ("rx_grid", "channel_est", "tx_symbols", "coded_bits")
+                for name in ("rx_grid", "tx_symbols", "coded_bits")
             }
             for name, value in arrays.items():
                 if not np.all(np.isfinite(value)):
@@ -129,21 +126,11 @@ def main() -> None:
                 constellation_maps[qm][label].add(point)
                 reverse_constellation_maps[qm][point].add(label)
             rx = complex_array(arrays["rx_grid"])
-            channel = complex_array(arrays["channel_est"])
-            reconstructed = np.einsum("skrl,skl->skr", channel, tx)
             common_mask = mask.any(axis=-1)
-            residual_energy = float(
-                np.sum(np.abs(rx[common_mask] - reconstructed[common_mask]) ** 2)
-            )
-            signal_energy = float(np.sum(np.abs(reconstructed[common_mask]) ** 2))
-            rx_values = int(np.count_nonzero(common_mask)) * rx.shape[-1]
-            reconstruction_residual_energy += residual_energy
-            reconstructed_signal_energy += signal_energy
-            observed_rx_count += rx_values
-            noise_variance_sum += float(sample["noise_var"]) * rx_values
-            if np.isfinite(snr):
-                reconstruction_by_snr[snr][0] += residual_energy
-                reconstruction_by_snr[snr][1] += signal_energy
+            nondata_re_count += int(np.count_nonzero(~common_mask))
+            nonzero_nondata_re_count += int(np.count_nonzero(
+                np.any(rx[~common_mask] != 0, axis=-1)
+            ))
             if np.any(tx[~mask] != 0.0):
                 warnings.append(f"sample {index}: tx_symbols outside data_mask are non-zero")
             if "traditional_eq" in sample:
@@ -216,17 +203,8 @@ def main() -> None:
             scenarios.items(), key=lambda item: (item[0][0], item[0][2], item[0][3])
         )
     ]
-    reconstruction_snr_db = 10.0 * np.log10(
-        reconstructed_signal_energy / max(1e-12, reconstruction_residual_energy)
-    )
-    reconstruction_rows = [
-        {
-            "snr_db": snr,
-            "reconstructed_signal_to_residual_db": 10.0
-            * np.log10(values[1] / max(1e-12, values[0])),
-        }
-        for snr, values in sorted(reconstruction_by_snr.items())
-    ]
+    if not nonzero_nondata_re_count:
+        warnings.append("No nonzero received REs outside data_mask; check whether pilots were discarded.")
     report = {
         "status": "FAIL" if errors else ("WARN" if warnings else "PASS"),
         "dataset_samples": len(dataset),
@@ -246,12 +224,10 @@ def main() -> None:
             if traditional_reference_energy > 0
             else None
         ),
-        "mean_declared_noise_var": noise_variance_sum / max(1, observed_rx_count),
-        "mean_reconstruction_residual_power": (
-            reconstruction_residual_energy / max(1, observed_rx_count)
-        ),
-        "reconstructed_signal_to_residual_db": reconstruction_snr_db,
-        "reconstruction_by_snr": reconstruction_rows,
+        "mean_declared_noise_var": float(np.mean(dataset.metadata["noise_var"][indices])),
+        "nondata_re_count": nondata_re_count,
+        "nonzero_nondata_re_count": nonzero_nondata_re_count,
+        "receiver_inputs": "No channel_est; nonzero nondata REs alone do not verify known pilots.",
         "value_ranges": dict(ranges),
         "errors": list(dict.fromkeys(errors)),
         "warnings": list(dict.fromkeys(warnings)),

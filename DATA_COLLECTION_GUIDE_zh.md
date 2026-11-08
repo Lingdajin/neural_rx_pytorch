@@ -1,5 +1,8 @@
 # 数据集采集指南(2×2 MIMO PDSCH 神经接收机)
 
+> 当前无显式 CSI 模型不读取 `channel_est`，训练不读取 `traditional_eq`。原采集文件仍可直接使用。
+> 请保留接收导频 RE；新增导频参考的建议见 [NO_CSI_ANALYSIS_zh.md](NO_CSI_ANALYSIS_zh.md)。
+
 本文档给出 `train.py` 所用 HDF5 训练集的**样本数量与分布规划建议**。字段定义、
 bit 顺序与写入格式请先阅读 [DATA_FORMAT.md](DATA_FORMAT.md),本指南不重复格式
 细节。文中"一格"指一个 `(MCS, RB)` 组合。

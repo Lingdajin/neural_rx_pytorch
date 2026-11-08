@@ -17,7 +17,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
 
-from neural_rx_pytorch.checkpoint import save_checkpoint
+from neural_rx_pytorch.checkpoint import check_model_architecture, save_checkpoint
 from neural_rx_pytorch.config import load_config, save_config
 from neural_rx_pytorch.data import MatlabH5Dataset, padded_collate
 from neural_rx_pytorch.engine import run_epoch
@@ -31,9 +31,10 @@ ROOT = Path(__file__).resolve().parent
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data", nargs="+", required=True, help="HDF5 files, glob, or directory")
+    parser.add_argument("--data", nargs="+", default=[str(ROOT / "dataset_h5")],
+                        help="HDF5 files, glob, or directory (default: dataset_h5)")
     parser.add_argument("--config", default=str(ROOT / "config" / "default_2x2.json"))
-    parser.add_argument("--output-dir", default=str(ROOT / "runs" / "default"))
+    parser.add_argument("--output-dir", default=str(ROOT / "runs" / "no_csi"))
     parser.add_argument("--resume", default=None, help="Checkpoint to resume, usually last.pt")
     parser.add_argument("--device", default="cuda", choices=("cuda", "cpu"))
     parser.add_argument("--epochs", type=int, default=None)
@@ -85,12 +86,20 @@ def main() -> None:
     if args.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but PyTorch cannot see a CUDA device. Use --device cpu.")
     device = torch.device(args.device)
+    model = NeuralPDSCHReceiver.from_config(config["model"]).to(device)
+    checkpoint = None
+    if args.resume:
+        checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
+        check_model_architecture(checkpoint, model)
     output_dir = Path(args.output_dir).resolve()
+    if not args.resume and any((output_dir / name).exists() for name in ("best.pt", "last.pt")):
+        raise FileExistsError("Output directory already contains checkpoints. Use --resume or a new directory.")
     output_dir.mkdir(parents=True, exist_ok=True)
     save_config(config, output_dir / "config.json")
 
     dataset = MatlabH5Dataset(
-        args.data, max_bits_per_symbol=int(config["model"]["max_bits_per_symbol"])
+        args.data, max_bits_per_symbol=int(config["model"]["max_bits_per_symbol"]),
+        load_traditional_eq=False,
     )
     split = config["split"]
     split_path = output_dir / "splits.npz"
@@ -135,7 +144,6 @@ def main() -> None:
         Subset(dataset, splits["validation"].tolist()), shuffle=False, **loader_options
     )
 
-    model = NeuralPDSCHReceiver.from_config(config["model"]).to(device)
     criterion = ReceiverLoss(**config["loss"])
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -143,7 +151,8 @@ def main() -> None:
         weight_decay=float(training["weight_decay"]),
     )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=3, min_lr=1e-6
+        optimizer, mode="min", factor=0.5,
+        patience=int(training.get("lr_scheduler_patience", 3)), min_lr=1e-6
     )
     amp_enabled = bool(training["amp"]) and device.type == "cuda"
     scaler = torch.amp.GradScaler(device.type, enabled=amp_enabled)
@@ -152,8 +161,7 @@ def main() -> None:
     best_loss = float("inf")
     stale_epochs = 0
     history: list[dict[str, float]] = []
-    if args.resume:
-        checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
+    if checkpoint is not None:
         model.load_state_dict(checkpoint["model_state"])
         optimizer.load_state_dict(checkpoint["optimizer_state"])
         scheduler.load_state_dict(checkpoint["scheduler_state"])
@@ -192,6 +200,7 @@ def main() -> None:
         else:
             stale_epochs += 1
         state = {
+            "model_architecture": model.architecture,
             "epoch": epoch,
             "model_state": model.state_dict(),
             "optimizer_state": optimizer.state_dict(),
@@ -217,7 +226,8 @@ def main() -> None:
             f"val={validation_metrics['loss']:.6f} BER={validation_metrics['ber']:.3e} "
             f"EVM={100*validation_metrics['neural_evm']:.2f}%"
         )
-        if stale_epochs >= int(training["early_stop_patience"]):
+        if (epoch >= int(training.get("early_stop_min_epochs", 0))
+                and stale_epochs >= int(training["early_stop_patience"])):
             print("Early stopping: validation loss did not improve.")
             break
 
