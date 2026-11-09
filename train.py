@@ -15,15 +15,20 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader
 
-from neural_rx_pytorch.checkpoint import save_checkpoint
+from neural_rx_pytorch.checkpoint import EXPECTED_ARCHITECTURE, save_checkpoint
 from neural_rx_pytorch.config import load_config, save_config
-from neural_rx_pytorch.data import MatlabH5Dataset, padded_collate
+from neural_rx_pytorch.data import MatlabH5Dataset, ResourceGridBatchSampler, padded_collate
 from neural_rx_pytorch.engine import run_epoch
 from neural_rx_pytorch.losses import ReceiverLoss
 from neural_rx_pytorch.model import NeuralPDSCHReceiver
-from neural_rx_pytorch.splits import load_splits, make_stratified_splits, save_splits
+from neural_rx_pytorch.splits import (
+    load_splits,
+    make_stratified_splits,
+    save_splits,
+    split_statistics,
+)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -58,7 +63,13 @@ def plot_history(history: list[dict[str, float]], path: Path) -> None:
     axes[0].set(xlabel="Epoch", ylabel="Loss", title="Training loss")
     axes[0].grid(alpha=0.3)
     axes[0].legend()
-    axes[1].semilogy(epochs, [row["validation_ber"] for row in history], label="BER")
+    plotted_ber = [
+        row["validation_ber"]
+        if row["validation_ber"] > 0.0
+        else row["validation_ber_upper_95"]
+        for row in history
+    ]
+    axes[1].semilogy(epochs, plotted_ber, label="BER (95% upper bound if 0 errors)")
     axes[1].plot(
         epochs,
         [100.0 * row["validation_neural_evm"] for row in history],
@@ -87,7 +98,6 @@ def main() -> None:
     device = torch.device(args.device)
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    save_config(config, output_dir / "config.json")
 
     dataset = MatlabH5Dataset(
         args.data, max_bits_per_symbol=int(config["model"]["max_bits_per_symbol"])
@@ -112,27 +122,34 @@ def main() -> None:
     if empty_splits:
         raise ValueError(
             f"Dataset is too small for non-empty splits {empty_splits}. "
-            "Collect more samples per (MCS, RB) group or adjust split fractions."
+            "Collect more samples per (MCS, Qm, RB, SNR) group or adjust split fractions."
         )
     if not args.resume:
         save_splits(splits, dataset, split_path)
+    (output_dir / "split_report.json").write_text(
+        json.dumps(split_statistics(splits, dataset), indent=2), encoding="utf-8"
+    )
     print(
         f"Samples: train={len(splits['train'])}, validation={len(splits['validation'])}, "
         f"test={len(splits['test'])}"
     )
     loader_options = dict(
-        batch_size=batch_size,
         num_workers=num_workers,
         pin_memory=device.type == "cuda",
         persistent_workers=num_workers > 0,
         collate_fn=padded_collate,
     )
-    generator = torch.Generator().manual_seed(seed)
+    train_batch_sampler = ResourceGridBatchSampler(
+        dataset, splits["train"], batch_size, shuffle=True, seed=seed
+    )
+    validation_batch_sampler = ResourceGridBatchSampler(
+        dataset, splits["validation"], batch_size, shuffle=False
+    )
     train_loader = DataLoader(
-        Subset(dataset, splits["train"].tolist()), shuffle=True, generator=generator, **loader_options
+        dataset, batch_sampler=train_batch_sampler, **loader_options
     )
     validation_loader = DataLoader(
-        Subset(dataset, splits["validation"].tolist()), shuffle=False, **loader_options
+        dataset, batch_sampler=validation_batch_sampler, **loader_options
     )
 
     model = NeuralPDSCHReceiver.from_config(config["model"]).to(device)
@@ -154,7 +171,18 @@ def main() -> None:
     history: list[dict[str, float]] = []
     if args.resume:
         checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
-        model.load_state_dict(checkpoint["model_state"])
+        if checkpoint.get("architecture") != EXPECTED_ARCHITECTURE:
+            raise ValueError(
+                "The resume checkpoint is not a joint DMRS receiver checkpoint. "
+                "Start a new run; LMMSE-assisted weights are not compatible."
+            )
+        try:
+            model.load_state_dict(checkpoint["model_state"])
+        except RuntimeError as error:
+            raise ValueError(
+                "Resume checkpoint and config do not describe the same model. "
+                "Use the config.json from the original run."
+            ) from error
         optimizer.load_state_dict(checkpoint["optimizer_state"])
         scheduler.load_state_dict(checkpoint["scheduler_state"])
         if checkpoint.get("scaler_state"):
@@ -165,7 +193,10 @@ def main() -> None:
         history = list(checkpoint.get("history", []))
         print(f"Resumed {args.resume} at epoch {start_epoch}")
 
+    save_config(config, output_dir / "config.json")
+
     for epoch in range(start_epoch, epochs + 1):
+        train_batch_sampler.set_epoch(epoch)
         train_metrics = run_epoch(
             model,
             train_loader,
@@ -192,6 +223,7 @@ def main() -> None:
         else:
             stale_epochs += 1
         state = {
+            "architecture": EXPECTED_ARCHITECTURE,
             "epoch": epoch,
             "model_state": model.state_dict(),
             "optimizer_state": optimizer.state_dict(),
@@ -215,6 +247,8 @@ def main() -> None:
         print(
             f"Epoch {epoch:03d}/{epochs:03d} train={train_metrics['loss']:.6f} "
             f"val={validation_metrics['loss']:.6f} BER={validation_metrics['ber']:.3e} "
+            f"({int(validation_metrics['bit_errors'])}/{int(validation_metrics['bit_count'])} bits; "
+            f"95% upper={validation_metrics['ber_upper_95']:.3e}) "
             f"EVM={100*validation_metrics['neural_evm']:.2f}%"
         )
         if stale_epochs >= int(training["early_stop_patience"]):

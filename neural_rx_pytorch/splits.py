@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
 
 from .data import MatlabH5Dataset
+
+SPLIT_SCHEMA_VERSION = 2
 
 
 def dataset_fingerprint(dataset: MatlabH5Dataset) -> str:
@@ -38,11 +41,17 @@ def make_stratified_splits(
     if np.any(fractions < 0) or not np.isclose(fractions.sum(), 1.0):
         raise ValueError("Split fractions must be non-negative and sum to one.")
     rng = np.random.default_rng(seed)
-    base_groups: dict[tuple[int, int], list[int]] = {}
+    base_groups: dict[tuple[int, int, int], list[int]] = {}
     for index, key in enumerate(
-        zip(dataset.metadata["mcs_index"], dataset.metadata["num_rbs"])
+        zip(
+            dataset.metadata["mcs_index"],
+            dataset.metadata["qm"],
+            dataset.metadata["num_rbs"],
+        )
     ):
-        base_groups.setdefault((int(key[0]), int(key[1])), []).append(index)
+        base_groups.setdefault(
+            (int(key[0]), int(key[1]), int(key[2])), []
+        ).append(index)
 
     # Discrete SNR sweeps should occur in every split. Continuously sampled SNR
     # values are unsuitable exact keys, so add SNR only when every subgroup can
@@ -80,9 +89,70 @@ def make_stratified_splits(
         output["train"].extend(values[:train_stop])
         output["validation"].extend(values[train_stop:validation_stop])
         output["test"].extend(values[validation_stop:])
-    return {
+    result = {
         name: rng.permutation(np.asarray(indices, dtype=np.int64))
         for name, indices in output.items()
+    }
+    validate_splits(result, len(dataset))
+    return result
+
+
+def validate_splits(splits: dict[str, np.ndarray], dataset_length: int) -> None:
+    """Reject missing, duplicated, overlapping, or out-of-range sample indices."""
+
+    expected = {"train", "validation", "test"}
+    if set(splits) != expected:
+        raise ValueError(f"Split names must be {sorted(expected)}.")
+    arrays = [np.asarray(splits[name], dtype=np.int64) for name in sorted(expected)]
+    merged = np.concatenate(arrays) if arrays else np.empty(0, dtype=np.int64)
+    if np.any(merged < 0) or np.any(merged >= dataset_length):
+        raise ValueError("Split file contains an out-of-range sample index.")
+    if len(np.unique(merged)) != len(merged):
+        raise ValueError("Train/validation/test splits overlap or contain duplicates.")
+    if len(merged) != dataset_length:
+        raise ValueError(
+            f"Splits cover {len(merged)} of {dataset_length} dataset samples."
+        )
+
+
+def split_statistics(
+    splits: dict[str, np.ndarray], dataset: MatlabH5Dataset
+) -> dict[str, object]:
+    """Return auditable per-scenario counts for the saved data partition."""
+
+    validate_splits(splits, len(dataset))
+    snr = dataset.metadata.get("snr_db")
+
+    def key(index: int) -> tuple[int, int, int, float | None]:
+        return (
+            int(dataset.metadata["mcs_index"][index]),
+            int(dataset.metadata["qm"][index]),
+            int(dataset.metadata["num_rbs"][index]),
+            None if snr is None else float(snr[index]),
+        )
+
+    counts = {
+        name: Counter(key(int(index)) for index in indices)
+        for name, indices in splits.items()
+    }
+    scenario_keys = sorted(
+        set().union(*(counter.keys() for counter in counts.values())),
+        key=lambda value: (value[0], value[1], value[2], float("-inf") if value[3] is None else value[3]),
+    )
+    return {
+        "schema_version": SPLIT_SCHEMA_VERSION,
+        "samples": {name: int(len(indices)) for name, indices in splits.items()},
+        "scenario_count": len(scenario_keys),
+        "scenarios": [
+            {
+                "mcs_index": scenario[0],
+                "qm": scenario[1],
+                "num_rbs": scenario[2],
+                "snr_db": scenario[3],
+                **{name: counts[name][scenario] for name in ("train", "validation", "test")},
+            }
+            for scenario in scenario_keys
+        ],
     }
 
 
@@ -96,16 +166,26 @@ def save_splits(
         **splits,
         dataset_length=np.asarray([len(dataset)], dtype=np.int64),
         fingerprint=np.asarray([dataset_fingerprint(dataset)]),
+        split_schema_version=np.asarray([SPLIT_SCHEMA_VERSION], dtype=np.int64),
     )
 
 
 def load_splits(path: str | Path, dataset: MatlabH5Dataset) -> dict[str, np.ndarray]:
     with np.load(path, allow_pickle=False) as stored:
+        version = int(stored["split_schema_version"][0]) if "split_schema_version" in stored else 1
+        if version != SPLIT_SCHEMA_VERSION:
+            raise ValueError(
+                f"Split file uses schema {version}, but schema {SPLIT_SCHEMA_VERSION} is required. "
+                "Create a new output directory (or remove splits.npz) to regenerate the "
+                "MCS/Qm/RB/SNR-stratified split."
+            )
         expected_length = int(stored["dataset_length"][0])
         expected_fingerprint = str(stored["fingerprint"][0])
         if expected_length != len(dataset) or expected_fingerprint != dataset_fingerprint(dataset):
             raise ValueError("Split file belongs to a different dataset version.")
-        return {
+        result = {
             name: np.asarray(stored[name], dtype=np.int64)
             for name in ("train", "validation", "test")
         }
+        validate_splits(result, len(dataset))
+        return result

@@ -14,10 +14,12 @@ axes automatically.
 | Dataset | Shape | Type | Meaning |
 | --- | --- | --- | --- |
 | `rx_grid` | `[N,S,K,2,2]` | `single` | Received grid; last axes are RX antenna and `[real,imag]` |
-| `channel_est` | `[N,S,K,2,2,2]` | `single` | Effective channel `H(rx,layer)` and `[real,imag]` |
+| `dmrs_grid` | `[N,S,K,2,2]` | `single` | Known transmitted DM-RS per layer; zero elsewhere; final axis is `[real,imag]` |
+| `dmrs_mask` | `[N,S,K,2]` | `uint8` | One at DM-RS REs for each layer |
 | `data_mask` | `[N,S,K,2]` | `uint8` | One on PDSCH data REs for each layer; zero on DM-RS/PTRS/padding |
 | `tx_symbols` | `[N,S,K,2,2]` | `single` | Transmitted layer-mapped QAM symbols and `[real,imag]` |
 | `coded_bits` | `[N,S,K,2,Qmax]` | `single` | Rate-matched/scrambled bits in mapper order, padded with zeros |
+| `channel_est` | `[N,S,K,2,2,2]` | `single` | Optional training teacher/diagnostic `H(rx,layer)`; never a model input |
 | `traditional_eq` | `[N,S,K,2,2]` | `single` | Optional traditional receiver symbols and `[real,imag]` |
 | `mcs_index` | `[N]` | integer | 3GPP MCS index (metadata/metric grouping) |
 | `qm` | `[N]` | integer | Bits per QAM symbol: 2, 4, 6, 8, or 10 |
@@ -41,12 +43,14 @@ PDSCH receive chain. The model output uses the convention **positive LLR/logit
 means bit 1**; negate it if the downstream MATLAB decoder expects positive for
 bit 0.
 
-`channel_est` should come from the same DM-RS estimator and interpolation used
-at deployment. Training on perfect channel values and deploying with LS/MMSE
-estimates creates a substantial distribution mismatch. `traditional_eq`, when
-present, should contain the actual conventional receiver output on the same
-data RE ordering. Otherwise the scripts compare against an internal LMMSE
-equalizer based on `channel_est` and `noise_var`.
+`dmrs_grid` must contain the exact layer-specific transmitted pilots (including
+scrambling/OCC effects), and `dmrs_mask` must not overlap `data_mask`. The joint
+model performs channel inference and detection directly from `rx_grid` and the
+known pilots. `channel_est` is optional and, when present, only supplies an
+auxiliary training target and a diagnostic LMMSE fallback; it is never fed to
+the neural receiver. Use deployment-quality rather than perfect CSI as the
+teacher. `traditional_eq`, when present, should contain the conventional
+receiver output on the same data-RE ordering.
 
 ## Collection recommendations
 
@@ -55,13 +59,15 @@ equalizer based on `channel_est` and `noise_var`.
 - Store roughly balanced sample counts for MCS/RB combinations, or use separate
   shards so the training corpus can be rebalanced easily.
 - Do not include DM-RS, PTRS, guard carriers, or unused REs in `data_mask`.
+- Store every layer's non-zero DM-RS values in `dmrs_grid`; set all other entries to zero.
 - Verify `tx_symbols == qammod(coded_bits, ...)` under your exact MATLAB mapping
   and normalization before a long training run.
 - Use approximately 80/10/10 train/validation/test data. `train.py` creates and
-saves a deterministic split stratified by `(mcs_index,num_rbs)`. When every
+saves a deterministic split stratified by `(mcs_index,qm,num_rbs)`. When every
 discrete SNR subgroup has enough repeated samples, `snr_db` is added to the
 stratification key so every SNR occurs in every split. Continuously sampled SNR
-falls back to `(mcs_index,num_rbs)` automatically.
+falls back to `(mcs_index,qm,num_rbs)` automatically. Split files are versioned,
+fingerprinted, and checked for complete, non-overlapping coverage.
 
 The current loss is supervised at the equalized-symbol and coded-bit levels.
 CRC/BLER requires feeding exported logits into the existing MATLAB PDSCH

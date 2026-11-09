@@ -21,7 +21,9 @@ from neural_rx_pytorch.model import NeuralPDSCHReceiver
 from neural_rx_pytorch.splits import load_splits, make_stratified_splits, save_splits
 
 
-def create_dataset(path: Path, axis_order: str = "python") -> None:
+def create_dataset(
+    path: Path, axis_order: str = "python", include_channel_est: bool = True
+) -> None:
     rng = np.random.default_rng(7)
     count, symbols, subcarriers = 12, 4, 24
     rx = rng.normal(size=(count, symbols, subcarriers, 2, 2)).astype(np.float32)
@@ -32,6 +34,12 @@ def create_dataset(path: Path, axis_order: str = "python") -> None:
     tx /= np.sqrt(2.0)
     bits = rng.integers(0, 2, size=(count, symbols, subcarriers, 2, 4)).astype(np.float32)
     mask = np.ones((count, symbols, subcarriers, 2), np.uint8)
+    dmrs = np.zeros((count, symbols, subcarriers, 2, 2), np.float32)
+    dmrs_mask = np.zeros((count, symbols, subcarriers, 2), np.uint8)
+    dmrs_mask[:, 1, 0::2, 0] = 1
+    dmrs_mask[:, 1, 1::2, 1] = 1
+    dmrs[..., 0][dmrs_mask.astype(bool)] = 1.0
+    mask[dmrs_mask.astype(bool)] = 0
     num_rbs = np.tile(np.asarray([1, 2], np.int64), count // 2)
     for index, rbs in enumerate(num_rbs):
         mask[index, :, 12 * rbs :] = 0
@@ -45,7 +53,10 @@ def create_dataset(path: Path, axis_order: str = "python") -> None:
     with h5py.File(path, "w") as handle:
         handle.attrs["axis_order"] = axis_order
         handle.create_dataset("rx_grid", data=stored(rx))
-        handle.create_dataset("channel_est", data=stored(channel))
+        handle.create_dataset("dmrs_grid", data=stored(dmrs))
+        handle.create_dataset("dmrs_mask", data=stored(dmrs_mask))
+        if include_channel_est:
+            handle.create_dataset("channel_est", data=stored(channel))
         handle.create_dataset("data_mask", data=stored(mask))
         handle.create_dataset("tx_symbols", data=stored(tx))
         handle.create_dataset("coded_bits", data=stored(bits))
@@ -86,10 +97,12 @@ class ReceiverSmokeTest(unittest.TestCase):
                     condition_channels=4,
                     num_iterations=2,
                     max_num_rbs=2,
+                    supported_qm=[2, 4],
                 )
                 outputs = model(
-                    batch["rx_grid"], batch["channel_est"], batch["noise_var"],
-                    batch["data_mask"], batch["qm"], batch["code_rate"], batch["num_rbs"],
+                    batch["rx_grid"], batch["dmrs_grid"], batch["dmrs_mask"],
+                    batch["noise_var"], batch["data_mask"], batch["qm"],
+                    batch["code_rate"], batch["num_rbs"],
                 )
                 self.assertEqual(outputs["bit_logits"].shape, (4, 4, 24, 2, 4))
                 self.assertEqual(outputs["equalized_symbols"].shape, (4, 4, 24, 2, 2))
@@ -97,6 +110,12 @@ class ReceiverSmokeTest(unittest.TestCase):
                 self.assertTrue(torch.isfinite(loss))
                 loss.backward()
                 self.assertTrue(any(parameter.grad is not None for parameter in model.parameters()))
+                no_teacher_batch = {
+                    name: value for name, value in batch.items() if name != "channel_est"
+                }
+                self.assertTrue(
+                    torch.isfinite(ReceiverLoss()(outputs, no_teacher_batch)["loss"])
+                )
 
                 splits = make_stratified_splits(dataset, 0.5, 0.25, 0.25, seed=42)
                 self.assertEqual(sum(len(value) for value in splits.values()), len(dataset))
@@ -124,7 +143,10 @@ class ReceiverSmokeTest(unittest.TestCase):
                 for index in (0, 1, len(python_data) - 1):
                     left = python_data[index]
                     right = matlab_data[index]
-                    for name in ("rx_grid", "channel_est", "data_mask", "tx_symbols", "coded_bits"):
+                    for name in (
+                        "rx_grid", "dmrs_grid", "dmrs_mask", "channel_est",
+                        "data_mask", "tx_symbols", "coded_bits",
+                    ):
                         torch.testing.assert_close(left[name], right[name])
             finally:
                 python_data.close()
@@ -139,9 +161,11 @@ class ReceiverSmokeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             data_path = root / "synthetic.h5"
+            inference_data_path = root / "synthetic_inference.h5"
             config_path = root / "config.json"
             run_dir = root / "run"
             create_dataset(data_path)
+            create_dataset(inference_data_path, include_channel_est=False)
             config = {
                 "model": {
                     "num_rx_antennas": 2,
@@ -149,8 +173,10 @@ class ReceiverSmokeTest(unittest.TestCase):
                     "max_bits_per_symbol": 4,
                     "hidden_channels": 8,
                     "condition_channels": 4,
+                    "pilot_channels": 4,
                     "num_iterations": 1,
                     "max_num_rbs": 2,
+                    "supported_qm": [2, 4],
                 },
                 "training": {
                     "epochs": 1,
@@ -164,7 +190,10 @@ class ReceiverSmokeTest(unittest.TestCase):
                     "seed": 42,
                 },
                 "split": {"train": 0.5, "validation": 0.25, "test": 0.25},
-                "loss": {"bit_weight": 1.0, "symbol_weight": 0.2},
+                "loss": {
+                    "bit_weight": 1.0, "symbol_weight": 0.2,
+                    "channel_weight": 0.05, "pilot_weight": 0.05,
+                },
             }
             config_path.write_text(json.dumps(config), encoding="utf-8")
             train_args = [
@@ -175,6 +204,7 @@ class ReceiverSmokeTest(unittest.TestCase):
                 train.main()
             self.assertTrue((run_dir / "best.pt").is_file())
             self.assertTrue((run_dir / "loss.png").is_file())
+            self.assertTrue((run_dir / "split_report.json").is_file())
 
             validation_dir = root / "validation"
             validation_args = [
@@ -186,6 +216,7 @@ class ReceiverSmokeTest(unittest.TestCase):
             with patch.object(sys, "argv", validation_args):
                 validate.main()
             self.assertTrue((validation_dir / "summary.json").is_file())
+            self.assertTrue((validation_dir / "metrics_by_scenario.csv").is_file())
 
             constellation_path = root / "constellation.mat"
             export_args = [
@@ -200,7 +231,7 @@ class ReceiverSmokeTest(unittest.TestCase):
 
             inference_path = root / "inference.mat"
             infer_args = [
-                "infer.py", "--input", str(data_path), "--checkpoint",
+                "infer.py", "--input", str(inference_data_path), "--checkpoint",
                 str(run_dir / "best.pt"), "--config", str(run_dir / "config.json"),
                 "--output", str(inference_path), "--device", "cpu",
             ]

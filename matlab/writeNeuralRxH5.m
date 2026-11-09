@@ -3,7 +3,8 @@ function writeNeuralRxH5(filename, data)
 %
 % Required fields (logical MATLAB dimensions):
 %   rxGrid       [N,S,K,2] complex
-%   channelEst   [N,S,K,2,2] complex, H(rx,layer)
+%   dmrsGrid     [N,S,K,2] complex, known DM-RS for each layer
+%   dmrsMask     [N,S,K,2] logical
 %   dataMask     [N,S,K,2] logical
 %   mcsIndex     [N,1], qm [N,1], codeRate [N,1]
 %   numRBs       [N,1], noiseVar [N,1]
@@ -11,7 +12,8 @@ function writeNeuralRxH5(filename, data)
 % Training files additionally require:
 %   txSymbols    [N,S,K,2] complex
 %   codedBits    [N,S,K,2,Qmax] single (0/1; Qmax <= 10)
-% Optional training comparison field:
+% Optional training teacher/comparison fields:
+%   channelEst   [N,S,K,2,2] complex, H(rx,layer)
 %   traditionalEq [N,S,K,2] complex
 
 arguments
@@ -25,7 +27,8 @@ end
 writeReal(filename, '/rx_grid', complexToIQ(data.rxGrid));
 h5writeatt(filename, '/', 'axis_order', 'matlab');
 h5writeatt(filename, '/', 'format_version', int32(1));
-writeReal(filename, '/channel_est', complexToIQ(data.channelEst));
+writeReal(filename, '/dmrs_grid', complexToIQ(data.dmrsGrid));
+writeReal(filename, '/dmrs_mask', uint8(data.dmrsMask));
 writeReal(filename, '/data_mask', uint8(data.dataMask));
 
 requiredMetadata = {'mcsIndex','qm','codeRate','numRBs','noiseVar'};
@@ -47,6 +50,9 @@ if isfield(data, 'codedBits')
 end
 if isfield(data, 'traditionalEq')
     writeReal(filename, '/traditional_eq', complexToIQ(data.traditionalEq));
+end
+if isfield(data, 'channelEst')
+    writeReal(filename, '/channel_est', complexToIQ(data.channelEst));
 end
 end
 

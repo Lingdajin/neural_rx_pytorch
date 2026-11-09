@@ -58,10 +58,11 @@ def main() -> None:
         outputs = model(*(batch[name] for name in MODEL_INPUTS))
     result = {
         "equalized_symbols": as_complex(outputs["equalized_symbols"]),
-        "traditional_lmmse_symbols": as_complex(outputs["lmmse_symbols"]),
+        "refined_channel": as_complex(outputs["refined_channel"]),
         "bit_llr_positive_one": outputs["bit_logits"].cpu().numpy(),
         "log_symbol_variance": outputs["log_symbol_var"].cpu().numpy(),
         "data_mask": batch["data_mask"].cpu().numpy(),
+        "dmrs_mask": batch["dmrs_mask"].cpu().numpy(),
         "mcs_index": batch["mcs_index"].cpu().numpy(),
         "qm": batch["qm"].cpu().numpy(),
         "num_rbs": batch["num_rbs"].cpu().numpy(),

@@ -17,6 +17,7 @@ from neural_rx_pytorch.config import load_config
 from neural_rx_pytorch.data import MatlabH5Dataset, padded_collate
 from neural_rx_pytorch.engine import MODEL_INPUTS, move_to_device
 from neural_rx_pytorch.model import NeuralPDSCHReceiver
+from neural_rx_pytorch.model import lmmse_equalize
 from neural_rx_pytorch.splits import load_splits
 
 
@@ -65,7 +66,18 @@ def main() -> None:
         for batch in loader:
             batch = move_to_device(batch, device)
             outputs = model(*(batch[name] for name in MODEL_INPUTS))
-            traditional = batch.get("traditional_eq", outputs["lmmse_symbols"])
+            traditional = batch.get("traditional_eq")
+            if traditional is None:
+                if "channel_est" not in batch:
+                    raise ValueError(
+                        "Constellation comparison needs traditional_eq or channel_est."
+                    )
+                traditional = lmmse_equalize(
+                    batch["rx_grid"],
+                    batch["channel_est"],
+                    batch["noise_var"],
+                    batch["data_mask"].any(dim=-1),
+                )
             mask = batch["data_mask"][0].cpu().numpy()
             reference = to_complex(batch["tx_symbols"])[0]
             neural = to_complex(outputs["equalized_symbols"])[0]

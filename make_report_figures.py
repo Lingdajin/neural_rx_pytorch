@@ -93,9 +93,9 @@ def fig_training() -> None:
 
 
 def fig_ber_snr() -> None:
-    """Coded BER vs SNR grouped by RB from results/test/metrics_by_mcs_rb.csv."""
+    """Coded BER vs SNR grouped by RB from results/test/metrics_by_scenario.csv."""
     rows = []
-    with (ROOT / "results" / "test" / "metrics_by_mcs_rb.csv").open() as handle:
+    with (ROOT / "results" / "test" / "metrics_by_scenario.csv").open() as handle:
         for row in csv.DictReader(handle):
             rows.append({k: float(v) for k, v in row.items()})
     # RB adaptation must hold the modulation fixed.  MCS 6 is the QPSK
@@ -131,7 +131,7 @@ def fig_ber_snr() -> None:
 def fig_modulation_ber_snr() -> None:
     """Coded BER vs SNR grouped by modulation at a common RB allocation."""
     rows = []
-    with (ROOT / "results" / "test" / "metrics_by_mcs_rb.csv").open() as handle:
+    with (ROOT / "results" / "test" / "metrics_by_scenario.csv").open() as handle:
         for row in csv.DictReader(handle):
             rows.append({k: float(v) for k, v in row.items()})
     target_rb = 52
@@ -170,7 +170,7 @@ def fig_modulation_ber_snr() -> None:
 def fig_evm_snr() -> None:
     """EVM vs SNR: neural vs traditional, averaged over RB."""
     rows = []
-    with (ROOT / "results" / "test" / "metrics_by_mcs_rb.csv").open() as handle:
+    with (ROOT / "results" / "test" / "metrics_by_scenario.csv").open() as handle:
         for row in csv.DictReader(handle):
             rows.append({k: float(v) for k, v in row.items()})
     snrs = sorted({r["snr_db"] for r in rows})
@@ -245,7 +245,7 @@ def fig_constellation() -> None:
 def fig_pipeline_demo() -> None:
     """Schematic gain bars: EVM improvement vs SNR from test metrics."""
     rows = []
-    with (ROOT / "results" / "test" / "metrics_by_mcs_rb.csv").open() as handle:
+    with (ROOT / "results" / "test" / "metrics_by_scenario.csv").open() as handle:
         for row in csv.DictReader(handle):
             rows.append({k: float(v) for k, v in row.items()})
     snrs = sorted({r["snr_db"] for r in rows})
@@ -268,7 +268,7 @@ def fig_pipeline_demo() -> None:
 
 def _load_test_metrics() -> list[dict[str, float]]:
     rows = []
-    with (ROOT / "results" / "test" / "metrics_by_mcs_rb.csv").open() as handle:
+    with (ROOT / "results" / "test" / "metrics_by_scenario.csv").open() as handle:
         for row in csv.DictReader(handle):
             rows.append({k: float(v) for k, v in row.items()})
     return rows

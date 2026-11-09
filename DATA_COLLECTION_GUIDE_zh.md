@@ -11,11 +11,11 @@ bit 顺序与写入格式请先阅读 [DATA_FORMAT.md](DATA_FORMAT.md),本指南
 1. **覆盖**部署范围内所有 `(MCS, RB, SNR, 信道类型, 多普勒)` 组合;
 2. **独立**生成:每个样本使用独立的信道与噪声实现,且先生成再划分,避免相关性泄漏;
 3. **均衡**每个 `(MCS, RB)` 格的样本数,便于分层划分与重平衡;
-4. **同源**训练数据:信道估计、噪声方差、传统均衡对照必须与部署接收链路一致。
+4. **同源**训练数据:已知 DM-RS、噪声方差与传统均衡对照必须与部署接收链路一致。
 
 ## 2. 样本总量分档
 
-本项目 PyTorch 模型很小(约 17.4 万参数),默认 50 epochs、batch=16。
+默认联合模型约 25.6 万参数，默认 50 epochs、batch=16。
 按"训练样本数 × epochs ≈ 有效梯度步数"折算:
 
 | 层级 | 训练集样本数 | 有效梯度步数(50 epochs) | 适用场景 |
@@ -71,8 +71,9 @@ bit 顺序与写入格式请先阅读 [DATA_FORMAT.md](DATA_FORMAT.md),本指南
 
 - 覆盖预期部署的信道类型(TDL / UMi / 站点射线追踪等),多普勒速度在目标范围内随机;
 - 若有 CFO 需求,在 `±cfo_offset_ppm` 内随机;
-- **`channel_est` 必须来自部署同款 DMRS 估计与插值**,禁止用完美 CSI 训练
-  (会造成严重的训练-部署分布失配);
+- `dmrs_grid/dmrs_mask` 必须对应每个样本实际发送的逐层导频，包括扰码与 OCC；
+- 可选 `channel_est` 只作辅助教师/诊断，不进入模型。若提供，应使用部署同款
+  DMRS 估计与插值，避免完美 CSI 教师造成目标失配；
 - `noise_var` 必须与 `rx_grid` 同一幅度标度(AGC 增益一致)。
 
 ## 4. 推荐配比方案
@@ -139,7 +140,9 @@ MCS: {4, 8, 12, 17, 20} × RB: {11, 25, 52, 106, 132} = 25 格
 
 - [ ] `coded_bits` 与 `tx_symbols` 的 QAM mapper 输入**逐 RE 对齐**(验证
       `tx_symbols == qammod(coded_bits, ...)`,含相同的归一化与加扰);
-- [ ] `channel_est` 来自部署同款 DMRS 估计器,非完美 CSI;
+- [ ] `dmrs_grid` 保存两层实际发送导频，掩码外为零，且 `dmrs_mask` 与
+      `data_mask` 无重叠；
+- [ ] 可选 `channel_est` 来自部署同款 DMRS 估计器,非完美 CSI;
 - [ ] `noise_var` 与 `rx_grid` 同一 AGC 标度;
 - [ ] `data_mask` 在 DMRS/PTRS/保护载波/补零处为 0,数据 RE 为 1;
 - [ ] `qm ≤ 10`(模型 `max_bits_per_symbol=10`);
@@ -155,9 +158,10 @@ python train.py --data <数据目录或 .h5 文件> \
   --output-dir runs/pdsch_2x2 --device cuda
 ```
 
-- 自动按 `(mcs_index, num_rbs)` **分层**划分 80/10/10 训练/验证/测试;
+- 自动按 `(mcs_index, qm, num_rbs)` **分层**划分 80/10/10 训练/验证/测试;
 - 每格样本数达标(§3.3)时分层划分自然均衡;
-- 可选 `snr_db` 仅用于验证报告分层,不参与划分 key,连续采样的 SNR 同样支持;
+- 离散且每格样本足够的 `snr_db` 自动加入分层 key；连续 SNR 自动退回基础 key；
+- 划分文件带版本与数据指纹，并强制检查无交集、无重复和 100% 样本覆盖；
 - 训练配置(epochs、batch_size、loss 权重等)见 `config/default_2x2.json`。
 
 ## 8. 常见问题
@@ -165,7 +169,7 @@ python train.py --data <数据目录或 .h5 文件> \
 | 现象 | 原因 | 对策 |
 | --- | --- | --- |
 | 验证 BER/EVM 波动大 | 某格验证样本太少 | 提高每格训练样本数(≥2K) |
-| 部署性能明显差于测试集 | 完美 CSI / 标度不一致 | 按 §6 检查 channel_est 与 noise_var |
+| 部署性能明显差于测试集 | DM-RS/掩码/标度不一致 | 按 §6 检查 DM-RS 与 noise_var |
 | 高阶调制收敛差 | 低 SNR 样本过多 | 按 §3.2 区间采样 |
 | 训练损失不下降 | bit 与符号未对齐 / 掩码错误 | 先跑小批验证,再大规模采集 |
 | 存储不足 | coded_bits 用 float32 | 改 uint8 + gzip,或减少大 RB 档样本 |

@@ -12,11 +12,13 @@ import h5py
 import numpy as np
 import torch
 from torch import Tensor
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 
 
 ARRAY_FIELDS = {
     "rx_grid": 5,
+    "dmrs_grid": 5,
+    "dmrs_mask": 4,
     "channel_est": 6,
     "data_mask": 4,
     "tx_symbols": 5,
@@ -89,7 +91,10 @@ class MatlabH5Dataset(Dataset[dict[str, Tensor]]):
         self.require_targets = require_targets
         self.shards: list[ShardInfo] = []
         self._handles: dict[Path, h5py.File] = {}
-        traditional_flags: list[bool] = []
+        optional_array_flags: dict[str, list[bool]] = {
+            "channel_est": [],
+            "traditional_eq": [],
+        }
         metadata: dict[str, list[np.ndarray]] = {name: [] for name in METADATA_FIELDS}
         optional_metadata: dict[str, list[np.ndarray]] = {
             name: [] for name in OPTIONAL_METADATA_FIELDS
@@ -103,7 +108,13 @@ class MatlabH5Dataset(Dataset[dict[str, Tensor]]):
                 axis_order = _text_attr(handle.attrs.get("axis_order", "matlab")).lower()
                 if axis_order not in {"matlab", "python"}:
                     raise ValueError(f"{path}: axis_order must be 'matlab' or 'python'.")
-                required = {"rx_grid", "channel_est", "data_mask", *METADATA_FIELDS}
+                required = {
+                    "rx_grid",
+                    "dmrs_grid",
+                    "dmrs_mask",
+                    "data_mask",
+                    *METADATA_FIELDS,
+                }
                 if require_targets:
                     required.update({"tx_symbols", "coded_bits"})
                 missing = sorted(required.difference(handle.keys()))
@@ -120,19 +131,37 @@ class MatlabH5Dataset(Dataset[dict[str, Tensor]]):
                 count, num_symbols, max_subcarriers, num_rx, iq = rx_shape
                 if num_rx != 2 or iq != 2:
                     raise ValueError(f"{path}: rx_grid must describe two RX antennas and IQ=2.")
-                channel_shape = _logical_shape(handle["channel_est"], axis_order)
-                if channel_shape != (
-                    count,
-                    num_symbols,
-                    max_subcarriers,
-                    2,
-                    2,
-                    2,
-                ):
-                    raise ValueError(f"{path}: channel_est has invalid logical shape {channel_shape}.")
                 mask_shape = _logical_shape(handle["data_mask"], axis_order)
                 if mask_shape != (count, num_symbols, max_subcarriers, 2):
                     raise ValueError(f"{path}: data_mask has invalid logical shape {mask_shape}.")
+                dmrs_shape = _logical_shape(handle["dmrs_grid"], axis_order)
+                if dmrs_shape != (count, num_symbols, max_subcarriers, 2, 2):
+                    raise ValueError(f"{path}: dmrs_grid has invalid logical shape {dmrs_shape}.")
+                dmrs_mask_shape = _logical_shape(handle["dmrs_mask"], axis_order)
+                if dmrs_mask_shape != (count, num_symbols, max_subcarriers, 2):
+                    raise ValueError(
+                        f"{path}: dmrs_mask has invalid logical shape {dmrs_mask_shape}."
+                    )
+                if "channel_est" in handle:
+                    channel_shape = _logical_shape(handle["channel_est"], axis_order)
+                    if channel_shape != (
+                        count,
+                        num_symbols,
+                        max_subcarriers,
+                        2,
+                        2,
+                        2,
+                    ):
+                        raise ValueError(
+                            f"{path}: channel_est has invalid logical shape {channel_shape}."
+                        )
+                if "traditional_eq" in handle:
+                    traditional_shape = _logical_shape(handle["traditional_eq"], axis_order)
+                    if traditional_shape != (count, num_symbols, max_subcarriers, 2, 2):
+                        raise ValueError(
+                            f"{path}: traditional_eq has invalid logical shape "
+                            f"{traditional_shape}."
+                        )
                 if require_targets:
                     symbol_shape = _logical_shape(handle["tx_symbols"], axis_order)
                     bit_shape = _logical_shape(handle["coded_bits"], axis_order)
@@ -162,16 +191,19 @@ class MatlabH5Dataset(Dataset[dict[str, Tensor]]):
                         if len(values) != count:
                             raise ValueError(f"{path}:{name} must contain one value per sample.")
                         optional_metadata[name].append(values)
-                traditional_flags.append("traditional_eq" in handle)
+                for name in optional_array_flags:
+                    optional_array_flags[name].append(name in handle)
                 self.shards.append(
                     ShardInfo(path, count, axis_order, num_symbols, max_subcarriers)
                 )
 
-        if any(traditional_flags) and not all(traditional_flags):
-            raise ValueError(
-                "traditional_eq must be present in every shard or omitted from every shard."
-            )
-        self.has_traditional_eq = all(traditional_flags)
+        for name, flags in optional_array_flags.items():
+            if any(flags) and not all(flags):
+                raise ValueError(
+                    f"{name} must be present in every shard or omitted from every shard."
+                )
+        self.has_channel_est = all(optional_array_flags["channel_est"])
+        self.has_traditional_eq = all(optional_array_flags["traditional_eq"])
 
         self.offsets = np.concatenate(
             ([0], np.cumsum([shard.count for shard in self.shards], dtype=np.int64))
@@ -189,6 +221,18 @@ class MatlabH5Dataset(Dataset[dict[str, Tensor]]):
                 self.metadata[name] = np.concatenate(optional_metadata[name]).astype(np.float32)
         if np.any(self.metadata["qm"] > max_bits_per_symbol):
             raise ValueError("Dataset Qm exceeds max_bits_per_symbol.")
+        if not np.all(np.isin(self.metadata["qm"], (2, 4, 6, 8, 10))):
+            raise ValueError("Dataset Qm must be one of 2, 4, 6, 8, or 10.")
+        if np.any(self.metadata["num_rbs"] <= 0):
+            raise ValueError("num_rbs must be positive.")
+        if np.any(~np.isfinite(self.metadata["code_rate"])) or np.any(
+            (self.metadata["code_rate"] <= 0) | (self.metadata["code_rate"] > 1)
+        ):
+            raise ValueError("code_rate must be finite and in (0,1].")
+        if np.any(~np.isfinite(self.metadata["noise_var"])) or np.any(
+            self.metadata["noise_var"] <= 0
+        ):
+            raise ValueError("noise_var must be finite and positive.")
         if np.any(self.metadata["num_rbs"] * 12 > np.repeat(
             [shard.max_subcarriers for shard in self.shards],
             [shard.count for shard in self.shards],
@@ -234,15 +278,17 @@ class MatlabH5Dataset(Dataset[dict[str, Tensor]]):
         num_subcarriers = int(self.metadata["num_rbs"][index]) * 12
 
         result: dict[str, Tensor] = {}
-        names = ["rx_grid", "channel_est", "data_mask"]
+        names = ["rx_grid", "dmrs_grid", "dmrs_mask", "data_mask"]
         if self.require_targets:
             names.extend(("tx_symbols", "coded_bits"))
+        if self.has_channel_est:
+            names.append("channel_est")
         if self.has_traditional_eq:
             names.append("traditional_eq")
         for name in names:
             value = self._read_array(handle[name], local_index, shard.axis_order)
             value = np.ascontiguousarray(value[:, :num_subcarriers])
-            if name == "data_mask":
+            if name in {"data_mask", "dmrs_mask"}:
                 result[name] = torch.from_numpy(value.astype(np.bool_))
             else:
                 result[name] = torch.from_numpy(value.astype(np.float32))
@@ -286,3 +332,56 @@ def padded_collate(samples: Sequence[dict[str, Tensor]]) -> dict[str, Tensor]:
         if name in samples[0]:
             result[name] = torch.stack([sample[name] for sample in samples])
     return result
+
+
+class ResourceGridBatchSampler(Sampler[list[int]]):
+    """Batch equal-RB samples together to avoid excessive zero-padding."""
+
+    def __init__(
+        self,
+        dataset: MatlabH5Dataset,
+        indices: Sequence[int] | np.ndarray,
+        batch_size: int,
+        shuffle: bool,
+        seed: int = 0,
+        drop_last: bool = False,
+    ) -> None:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive.")
+        self.batch_size = int(batch_size)
+        self.shuffle = shuffle
+        self.seed = int(seed)
+        self.drop_last = drop_last
+        self.epoch = 0
+        self.buckets: dict[int, np.ndarray] = {}
+        values = np.asarray(indices, dtype=np.int64)
+        for num_rbs in np.unique(dataset.metadata["num_rbs"][values]):
+            selected = values[dataset.metadata["num_rbs"][values] == num_rbs]
+            self.buckets[int(num_rbs)] = selected
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed + self.epoch)
+        batches: list[list[int]] = []
+        for num_rbs in sorted(self.buckets):
+            values = self.buckets[num_rbs].copy()
+            if self.shuffle:
+                rng.shuffle(values)
+            stop = len(values) if not self.drop_last else len(values) - len(values) % self.batch_size
+            for start in range(0, stop, self.batch_size):
+                batch = values[start : start + self.batch_size]
+                if len(batch) == self.batch_size or not self.drop_last:
+                    batches.append(batch.tolist())
+        if self.shuffle:
+            rng.shuffle(batches)
+        yield from batches
+
+    def __len__(self) -> int:
+        if self.drop_last:
+            return sum(len(values) // self.batch_size for values in self.buckets.values())
+        return sum(
+            (len(values) + self.batch_size - 1) // self.batch_size
+            for values in self.buckets.values()
+        )

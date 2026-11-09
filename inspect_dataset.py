@@ -86,10 +86,10 @@ def main() -> None:
             if not np.isfinite(float(sample["noise_var"])) or float(sample["noise_var"]) <= 0:
                 errors.append(f"sample {index}: noise_var must be finite and positive")
 
-            arrays = {
-                name: sample[name].numpy()
-                for name in ("rx_grid", "channel_est", "tx_symbols", "coded_bits")
-            }
+            array_names = ["rx_grid", "dmrs_grid", "tx_symbols", "coded_bits"]
+            if "channel_est" in sample:
+                array_names.append("channel_est")
+            arrays = {name: sample[name].numpy() for name in array_names}
             for name, value in arrays.items():
                 if not np.all(np.isfinite(value)):
                     errors.append(f"sample {index}: {name} contains NaN or Inf")
@@ -97,6 +97,20 @@ def main() -> None:
                 ranges[name][1] = max(ranges[name][1], float(np.nanmax(value)))
 
             mask = sample["data_mask"].numpy().astype(bool)
+            dmrs_mask = sample["dmrs_mask"].numpy().astype(bool)
+            dmrs = complex_array(arrays["dmrs_grid"])
+            if np.any(mask & dmrs_mask):
+                errors.append(f"sample {index}: data_mask and dmrs_mask overlap")
+            if np.any(dmrs[~dmrs_mask] != 0.0):
+                errors.append(f"sample {index}: dmrs_grid is non-zero outside dmrs_mask")
+            for layer in range(2):
+                layer_pilots = dmrs_mask[..., layer]
+                if not layer_pilots.any():
+                    errors.append(f"sample {index}: layer {layer + 1} has no DM-RS")
+                elif np.any(np.abs(dmrs[..., layer][layer_pilots]) < 1e-8):
+                    errors.append(
+                        f"sample {index}: layer {layer + 1} has zero-valued active DM-RS"
+                    )
             bits = arrays["coded_bits"]
             if not mask.any():
                 errors.append(f"sample {index}: data_mask has no active RE")
@@ -129,21 +143,22 @@ def main() -> None:
                 constellation_maps[qm][label].add(point)
                 reverse_constellation_maps[qm][point].add(label)
             rx = complex_array(arrays["rx_grid"])
-            channel = complex_array(arrays["channel_est"])
-            reconstructed = np.einsum("skrl,skl->skr", channel, tx)
             common_mask = mask.any(axis=-1)
-            residual_energy = float(
-                np.sum(np.abs(rx[common_mask] - reconstructed[common_mask]) ** 2)
-            )
-            signal_energy = float(np.sum(np.abs(reconstructed[common_mask]) ** 2))
             rx_values = int(np.count_nonzero(common_mask)) * rx.shape[-1]
-            reconstruction_residual_energy += residual_energy
-            reconstructed_signal_energy += signal_energy
             observed_rx_count += rx_values
             noise_variance_sum += float(sample["noise_var"]) * rx_values
-            if np.isfinite(snr):
-                reconstruction_by_snr[snr][0] += residual_energy
-                reconstruction_by_snr[snr][1] += signal_energy
+            if "channel_est" in arrays:
+                channel = complex_array(arrays["channel_est"])
+                reconstructed = np.einsum("skrl,skl->skr", channel, tx)
+                residual_energy = float(
+                    np.sum(np.abs(rx[common_mask] - reconstructed[common_mask]) ** 2)
+                )
+                signal_energy = float(np.sum(np.abs(reconstructed[common_mask]) ** 2))
+                reconstruction_residual_energy += residual_energy
+                reconstructed_signal_energy += signal_energy
+                if np.isfinite(snr):
+                    reconstruction_by_snr[snr][0] += residual_energy
+                    reconstruction_by_snr[snr][1] += signal_energy
             if np.any(tx[~mask] != 0.0):
                 warnings.append(f"sample {index}: tx_symbols outside data_mask are non-zero")
             if "traditional_eq" in sample:
@@ -216,8 +231,12 @@ def main() -> None:
             scenarios.items(), key=lambda item: (item[0][0], item[0][2], item[0][3])
         )
     ]
-    reconstruction_snr_db = 10.0 * np.log10(
-        reconstructed_signal_energy / max(1e-12, reconstruction_residual_energy)
+    reconstruction_snr_db = (
+        10.0 * np.log10(
+            reconstructed_signal_energy / max(1e-12, reconstruction_residual_energy)
+        )
+        if reconstructed_signal_energy > 0.0
+        else None
     )
     reconstruction_rows = [
         {
@@ -232,6 +251,7 @@ def main() -> None:
         "dataset_samples": len(dataset),
         "inspected_samples": len(indices),
         "shards": len(dataset.shards),
+        "has_channel_est": dataset.has_channel_est,
         "has_traditional_eq": dataset.has_traditional_eq,
         "scenarios": scenario_rows,
         "valid_re_fraction": valid_re_count / max(1, total_re_count),

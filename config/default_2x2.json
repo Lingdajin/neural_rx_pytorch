@@ -5,8 +5,10 @@
     "max_bits_per_symbol": 10,
     "hidden_channels": 64,
     "condition_channels": 16,
+    "pilot_channels": 32,
     "num_iterations": 6,
-    "max_num_rbs": 275
+    "max_num_rbs": 275,
+    "supported_qm": [2, 4, 6, 8, 10]
   },
   "training": {
     "epochs": 50,
@@ -26,6 +28,8 @@
   },
   "loss": {
     "bit_weight": 1.0,
-    "symbol_weight": 0.2
+    "symbol_weight": 0.2,
+    "channel_weight": 0.05,
+    "pilot_weight": 0.05
   }
 }

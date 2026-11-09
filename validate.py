@@ -10,15 +10,16 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader
 
 from neural_rx_pytorch.checkpoint import load_model_checkpoint
 from neural_rx_pytorch.config import load_config
-from neural_rx_pytorch.data import MatlabH5Dataset, padded_collate
+from neural_rx_pytorch.data import MatlabH5Dataset, ResourceGridBatchSampler, padded_collate
 from neural_rx_pytorch.engine import MODEL_INPUTS, move_to_device
 from neural_rx_pytorch.losses import ReceiverLoss
 from neural_rx_pytorch.metrics import ReceiverMetricAccumulator
 from neural_rx_pytorch.model import NeuralPDSCHReceiver
+from neural_rx_pytorch.model import lmmse_equalize
 from neural_rx_pytorch.splits import load_splits
 
 
@@ -50,9 +51,10 @@ def main() -> None:
     )
     indices = load_splits(args.splits, dataset)[args.split]
     loader = DataLoader(
-        Subset(dataset, indices.tolist()),
-        batch_size=args.batch_size,
-        shuffle=False,
+        dataset,
+        batch_sampler=ResourceGridBatchSampler(
+            dataset, indices, args.batch_size, shuffle=False
+        ),
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
         persistent_workers=args.num_workers > 0,
@@ -63,7 +65,7 @@ def main() -> None:
     criterion = ReceiverLoss(**config["loss"])
 
     overall = ReceiverMetricAccumulator()
-    grouped: dict[tuple[int, int, float | None], ReceiverMetricAccumulator] = {}
+    grouped: dict[tuple[int, int, int, float | None], ReceiverMetricAccumulator] = {}
     model.eval()
     with torch.no_grad():
         for batch in loader:
@@ -74,13 +76,21 @@ def main() -> None:
                 selection = slice(sample, sample + 1)
                 sample_batch = {name: value[selection] for name, value in batch.items()}
                 sample_output = {name: value[selection] for name, value in outputs.items()}
-                baseline = sample_batch.get("traditional_eq", sample_output["lmmse_symbols"])
+                baseline = sample_batch.get("traditional_eq")
+                if baseline is None and "channel_est" in sample_batch:
+                    baseline = lmmse_equalize(
+                        sample_batch["rx_grid"],
+                        sample_batch["channel_est"],
+                        sample_batch["noise_var"],
+                        sample_batch["data_mask"].any(dim=-1),
+                    )
                 sample_losses = criterion(sample_output, sample_batch)
                 snr_db = (
                     float(sample_batch["snr_db"][0]) if "snr_db" in sample_batch else None
                 )
                 key = (
                     int(sample_batch["mcs_index"][0]),
+                    int(sample_batch["qm"][0]),
                     int(sample_batch["num_rbs"][0]),
                     snr_db,
                 )
@@ -90,11 +100,13 @@ def main() -> None:
                 overall.update(sample_losses, sample_output, sample_batch, baseline)
 
     rows = []
-    for (mcs, num_rbs, snr_db), accumulator in sorted(
-        grouped.items(), key=lambda item: (item[0][0], item[0][1], item[0][2] or 0.0)
+    for (mcs, qm, num_rbs, snr_db), accumulator in sorted(
+        grouped.items(),
+        key=lambda item: (item[0][0], item[0][1], item[0][2], item[0][3] or 0.0),
     ):
         row = {
             "mcs_index": mcs,
+            "qm": qm,
             "num_rbs": num_rbs,
             "snr_db": "" if snr_db is None else snr_db,
             "samples": accumulator.count,
@@ -103,7 +115,7 @@ def main() -> None:
         rows.append(row)
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    with (output_dir / "metrics_by_mcs_rb.csv").open("w", newline="", encoding="utf-8") as handle:
+    with (output_dir / "metrics_by_scenario.csv").open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
@@ -112,7 +124,8 @@ def main() -> None:
         "samples": len(indices),
         "checkpoint_epoch": int(checkpoint["epoch"]),
         "metrics": overall.compute(),
-        "evm_baseline": "traditional_eq from dataset, otherwise LMMSE(channel_est, noise_var)",
+        "receiver_inputs": "rx_grid, dmrs_grid/mask, noise_var, masks, Qm/rate/RB; no channel_est or LMMSE",
+        "evm_baseline": "traditional_eq from dataset, otherwise diagnostic LMMSE(channel_est, noise_var)",
     }
     (output_dir / "summary.json").write_text(
         json.dumps(summary, indent=2), encoding="utf-8"
