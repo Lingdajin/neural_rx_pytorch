@@ -7,16 +7,18 @@ contains a fully convolutional PyTorch receiver trained from MATLAB link-level
 captures. One checkpoint supports variable MCS and RB allocations by using
 `Qm`, code rate, and RB count as conditioning inputs and masking padded REs.
 
-The model uses received IQ, noise variance, data masks and scheduling conditions
+The model uses received IQ, both layers' known transmitted DM-RS IQ and masks,
+noise variance, data masks and scheduling conditions
 without channel estimates or LMMSE. Fixed one-hot layer identities distinguish
 the two streams in the shared iterative graph blocks. It directly predicts:
 
 - neural equalized constellation symbols;
 - coded-bit logits for up to 1024-QAM (`Qm <= 10`).
 
-Legacy checkpoints are incompatible: train from scratch in a new directory.
-Legacy HDF5 files remain usable; training never reads `channel_est` or
-`traditional_eq`. See [the architecture and training analysis](NO_CSI_ANALYSIS_zh.md).
+CSI/LMMSE and pilot-free checkpoints are incompatible with `pdsch_dmrs_v1`:
+train from scratch in a new directory. All HDF5 files must now supply
+`dmrs_grid` and `dmrs_mask`; training never reads `channel_est` or
+`traditional_eq`. See [the DM-RS validation guide](DMRS_VALIDATION_zh.md).
 Keep received pilot REs in `rx_grid`; the data mask limits supervision and outputs.
 
 This is a structural CGNN migration (state initialization, inter-layer graph
@@ -57,23 +59,23 @@ need to fit in RAM.
 Run commands from `neural_rx_pytorch/`:
 
 ```bash
-python train.py --data dataset_h5 --output-dir runs/no_csi --device cuda
+python train.py --data dataset_h5 --output-dir runs/dmrs --device cuda
 ```
 
 Override common settings without editing JSON:
 
 ```bash
-python train.py --data dataset_h5 --output-dir runs/no_csi \
+python train.py --data dataset_h5 --output-dir runs/dmrs \
   --epochs 80 --batch-size 24 --num-workers 8
 ```
 
 Outputs include `best.pt`, `last.pt`, `history.csv`, `loss.png`, `config.json`,
 and `splits.npz`. Without CLI overrides, training reads `dataset_h5` and writes
-`runs/no_csi`. Only checkpoints from the current architecture can resume. Resume with:
+`runs/dmrs`. Only checkpoints from the current architecture can resume. Resume with:
 
 ```bash
-python train.py --data dataset_h5 --output-dir runs/no_csi \
-  --resume runs/no_csi/last.pt
+python train.py --data dataset_h5 --output-dir runs/dmrs \
+  --resume runs/dmrs/last.pt
 ```
 
 Do not change or reorder the dataset shards when resuming or evaluating: the
@@ -83,15 +85,15 @@ saved split file contains a dataset fingerprint and rejects a mismatch.
 
 ```bash
 python validate.py --data dataset_h5 \
-  --checkpoint runs/no_csi/best.pt \
-  --splits runs/no_csi/splits.npz \
-  --config runs/no_csi/config.json \
+  --checkpoint runs/dmrs/best.pt \
+  --splits runs/dmrs/splits.npz \
+  --config runs/dmrs/config.json \
   --split validation --output-dir results/validation
 
 python validate.py --data dataset_h5 \
-  --checkpoint runs/no_csi/best.pt \
-  --splits runs/no_csi/splits.npz \
-  --config runs/no_csi/config.json \
+  --checkpoint runs/dmrs/best.pt \
+  --splits runs/dmrs/splits.npz \
+  --config runs/dmrs/config.json \
   --split test --output-dir results/test
 ```
 
@@ -105,9 +107,9 @@ decoder; coded BER alone is not a substitute for BLER.
 
 ```bash
 python export_constellation.py --data dataset_h5 \
-  --checkpoint runs/no_csi/best.pt \
-  --splits runs/no_csi/splits.npz \
-  --config runs/no_csi/config.json \
+  --checkpoint runs/dmrs/best.pt \
+  --splits runs/dmrs/splits.npz \
+  --config runs/dmrs/config.json \
   --split test --output results/constellation.mat
 ```
 

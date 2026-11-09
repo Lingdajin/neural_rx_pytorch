@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader, Subset
 from neural_rx_pytorch.checkpoint import load_model_checkpoint
 from neural_rx_pytorch.config import load_config
 from neural_rx_pytorch.data import MatlabH5Dataset, padded_collate
-from neural_rx_pytorch.engine import MODEL_INPUTS, move_to_device
+from neural_rx_pytorch.engine import MODEL_INPUTS, ablate_dmrs, move_to_device
 from neural_rx_pytorch.losses import ReceiverLoss
 from neural_rx_pytorch.metrics import ReceiverMetricAccumulator
 from neural_rx_pytorch.model import NeuralPDSCHReceiver
@@ -36,6 +36,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--dmrs-mode", choices=("correct", "zero", "phase_rotate"), default="correct",
+                        help="Evaluate with correct, absent, or 90-degree-rotated pilot references")
     return parser.parse_args()
 
 
@@ -69,6 +71,7 @@ def main() -> None:
     with torch.no_grad():
         for batch in loader:
             batch = move_to_device(batch, device)
+            batch = ablate_dmrs(batch, args.dmrs_mode)
             outputs = model(*(batch[name] for name in MODEL_INPUTS))
             for sample in range(batch["rx_grid"].shape[0]):
                 selection = slice(sample, sample + 1)
@@ -109,6 +112,7 @@ def main() -> None:
         writer.writerows(rows)
     summary = {
         "split": args.split,
+        "dmrs_mode": args.dmrs_mode,
         "samples": len(indices),
         "checkpoint_epoch": int(checkpoint["epoch"]),
         "metrics": overall.compute(),

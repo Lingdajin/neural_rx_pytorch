@@ -1,5 +1,8 @@
 # 去除信道估计与 LMMSE：结构修改、性能影响和训练建议
 
+> 历史版本：本文记录无已知导频的 `pdsch_no_csi_v1`。当前网络已加入 `dmrs_grid` / `dmrs_mask`，
+> 新结构和验证方法见 [DMRS_VALIDATION_zh.md](DMRS_VALIDATION_zh.md)。下文的数据检查结果是更新导频字段之前的记录。
+
 本文对应 `pdsch_no_csi_v1`。代码和接口已修改并做功能验证；尚未完成新旧模型的全量训练对照，因此下面的性能影响是结构分析，不是实测 BER/BLER 增益结论。
 
 ## 1. 原结构与新结构

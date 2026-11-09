@@ -58,6 +58,9 @@ def main() -> None:
     traditional_reference_energy = 0.0
     nondata_re_count = 0
     nonzero_nondata_re_count = 0
+    dmrs_counts = np.zeros(2, dtype=np.int64)
+    dmrs_energy = np.zeros(2, dtype=np.float64)
+    rank_deficient_pilots = 0
     constellation_maps: dict[
         int, dict[tuple[int, ...], set[tuple[float, float]]]
     ] = defaultdict(lambda: defaultdict(set))
@@ -85,7 +88,7 @@ def main() -> None:
 
             arrays = {
                 name: sample[name].numpy()
-                for name in ("rx_grid", "tx_symbols", "coded_bits")
+                for name in ("rx_grid", "dmrs_grid", "tx_symbols", "coded_bits")
             }
             for name, value in arrays.items():
                 if not np.all(np.isfinite(value)):
@@ -94,6 +97,14 @@ def main() -> None:
                 ranges[name][1] = max(ranges[name][1], float(np.nanmax(value)))
 
             mask = sample["data_mask"].numpy().astype(bool)
+            pilot_mask = sample["dmrs_mask"].numpy()
+            pilot = complex_array(arrays["dmrs_grid"])
+            dmrs_counts += pilot_mask.sum(axis=(0, 1))
+            dmrs_energy += (np.abs(pilot) ** 2).sum(axis=(0, 1))
+            # Global rank is a necessary diagnostic for a locally constant
+            # two-layer channel, not proof of local CDM identifiability/alignment.
+            if np.linalg.matrix_rank(pilot.reshape(-1, 2)) < 2:
+                rank_deficient_pilots += 1
             bits = arrays["coded_bits"]
             if not mask.any():
                 errors.append(f"sample {index}: data_mask has no active RE")
@@ -205,6 +216,8 @@ def main() -> None:
     ]
     if not nonzero_nondata_re_count:
         warnings.append("No nonzero received REs outside data_mask; check whether pilots were discarded.")
+    if rank_deficient_pilots:
+        warnings.append(f"{rank_deficient_pilots} samples have globally rank-deficient two-layer pilots.")
     report = {
         "status": "FAIL" if errors else ("WARN" if warnings else "PASS"),
         "dataset_samples": len(dataset),
@@ -227,7 +240,11 @@ def main() -> None:
         "mean_declared_noise_var": float(np.mean(dataset.metadata["noise_var"][indices])),
         "nondata_re_count": nondata_re_count,
         "nonzero_nondata_re_count": nonzero_nondata_re_count,
-        "receiver_inputs": "No channel_est; nonzero nondata REs alone do not verify known pilots.",
+        "dmrs_re_count_per_layer": dmrs_counts.tolist(),
+        "dmrs_mean_power_per_layer": (dmrs_energy / np.maximum(dmrs_counts, 1)).tolist(),
+        "dmrs_rank_deficient_samples": rank_deficient_pilots,
+        "receiver_inputs": "Known DM-RS IQ and masks; no channel_est or LMMSE.",
+        "dmrs_alignment": "Structural checks only; exact slot/port/sequence alignment requires transmitter records or link-level validation.",
         "value_ranges": dict(ranges),
         "errors": list(dict.fromkeys(errors)),
         "warnings": list(dict.fromkeys(warnings)),

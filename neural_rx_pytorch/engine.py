@@ -17,7 +17,25 @@ MODEL_INPUTS = (
     "qm",
     "code_rate",
     "num_rbs",
+    "dmrs_grid",
+    "dmrs_mask",
 )
+
+
+def ablate_dmrs(batch: dict[str, Tensor], mode: str) -> dict[str, Tensor]:
+    """Evaluation controls only; preserve RX, labels and the original batch."""
+    if mode == "correct":
+        return batch
+    result = dict(batch)
+    grid = batch["dmrs_grid"]
+    if mode == "zero":
+        result["dmrs_grid"] = torch.zeros_like(grid)
+        result["dmrs_mask"] = torch.zeros_like(batch["dmrs_mask"])
+    elif mode == "phase_rotate":
+        result["dmrs_grid"] = torch.stack((-grid[..., 1], grid[..., 0]), dim=-1)
+    else:
+        raise ValueError(f"Unknown DM-RS control: {mode}")
+    return result
 
 
 def move_to_device(batch: dict[str, Tensor], device: torch.device) -> dict[str, Tensor]:

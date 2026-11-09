@@ -66,6 +66,7 @@ class ReceiverMetricAccumulator:
         self.bit_count = 0.0
         self.neural_error_power = 0.0
         self.neural_reference_power = 0.0
+        self.neural_symbol_power = 0.0
         self.traditional_error_power = 0.0
         self.traditional_reference_power = 0.0
         self.traditional_samples = 0
@@ -95,6 +96,10 @@ class ReceiverMetricAccumulator:
         self.bit_count += float(bits)
         self.neural_error_power += float(neural_error)
         self.neural_reference_power += float(neural_reference)
+        self.neural_symbol_power += float((
+            outputs["equalized_symbols"].double().square().sum(dim=-1)
+            * batch["data_mask"]
+        ).sum())
         if traditional is not None:
             traditional_error, traditional_reference = masked_evm_sums(
                 traditional, batch["tx_symbols"], batch["data_mask"]
@@ -109,6 +114,9 @@ class ReceiverMetricAccumulator:
         result["neural_evm"] = (
             self.neural_error_power / max(1e-12, self.neural_reference_power)
         ) ** 0.5
+        result["neural_symbol_power_ratio"] = (
+            self.neural_symbol_power / max(1e-12, self.neural_reference_power)
+        )
         if self.traditional_samples:
             result["traditional_evm"] = (
                 self.traditional_error_power

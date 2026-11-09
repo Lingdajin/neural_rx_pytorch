@@ -1,8 +1,9 @@
 # PyTorch 版 2x2 MIMO PDSCH 神经接收机
 
-当前版本已去除 `channel_est` 输入和内部 LMMSE，直接预测发送符号与 bit logits，
-并通过固定层标识区分两条空间流。原版检查点不能续训，必须在新目录重新训练。
-结构变化、性能限制和训练建议见 [NO_CSI_ANALYSIS_zh.md](NO_CSI_ANALYSIS_zh.md)。
+当前版本 `pdsch_dmrs_v1` 在现有迭代网络中加入两层已知 DM-RS 参考及掩码，
+直接预测发送符号与 bit logits；不使用 `channel_est` 或内部 LMMSE。
+CSI/LMMSE 版及无导频版检查点均不能续训，必须在新目录重新训练。
+结构、数据检查与消融验证方法见 [DMRS_VALIDATION_zh.md](DMRS_VALIDATION_zh.md)。
 
 本目录是独立于原 TensorFlow/Sionna PUSCH 运行环境的新实现。模型保留了
 CGNN 的主要结构：状态初始化、层间消息聚合、多轮卷积状态更新和读出头，
@@ -34,6 +35,8 @@ pip install -r requirements.txt
 | --- | --- | --- |
 | `rx_grid` | `[N,S,K,2,2]` | 两根接收天线的频域网格，末维为实部/虚部 |
 | `data_mask` | `[N,S,K,2]` | PDSCH 数据 RE 为 1，导频/PTRS/补零为 0 |
+| `dmrs_grid` | `[N,S,K,2,2]` | 两层已知发送 DM-RS 的实部/虚部，掩码外为零 |
+| `dmrs_mask` | `[N,S,K,2]` | 两层导频位置；与同层数据掩码不重叠 |
 | `tx_symbols` | `[N,S,K,2,2]` | 层映射后的发送 QAM 符号 |
 | `coded_bits` | `[N,S,K,2,Qmax]` | 速率匹配和加扰后的 mapper 输入 bit |
 | `traditional_eq` | `[N,S,K,2,2]` | 可选，仅离线验证/星座对照读取，训练不读取 |
@@ -58,7 +61,7 @@ python inspect_dataset.py --data dataset_h5 --output dataset_report.json
 只有报告状态为 `PASS` 或已确认 `WARN` 原因后再开始训练。
 
 ```bash
-python train.py --data dataset_h5 --output-dir runs/no_csi --device cuda
+python train.py --data dataset_h5 --output-dir runs/dmrs --device cuda
 ```
 
 训练脚本按 `(MCS,RB)` 分层生成固定的 80%/10%/10% 训练、验证和测试集。如果
@@ -75,21 +78,21 @@ python train.py --data dataset_h5 --output-dir runs/no_csi --device cuda
 续训命令：
 
 省略训练的 `--data` 时默认读取工程内的 `dataset_h5`，省略 `--output-dir`
-时默认输出到 `runs/no_csi`。已有检查点的目录必须显式 `--resume`。
+时默认输出到 `runs/dmrs`。已有检查点的目录必须显式 `--resume`。
 
 ```bash
-python train.py --data dataset_h5 --output-dir runs/no_csi \
-  --config runs/no_csi/config.json \
-  --resume runs/no_csi/last.pt --device cuda
+python train.py --data dataset_h5 --output-dir runs/dmrs \
+  --config runs/dmrs/config.json \
+  --resume runs/dmrs/last.pt --device cuda
 ```
 
 ## 4. 验证和测试
 
 ```bash
 python validate.py --data dataset_h5 \
-  --checkpoint runs/no_csi/best.pt \
-  --splits runs/no_csi/splits.npz \
-  --config runs/no_csi/config.json \
+  --checkpoint runs/dmrs/best.pt \
+  --splits runs/dmrs/splits.npz \
+  --config runs/dmrs/config.json \
   --split validation --output-dir results/validation
 ```
 
@@ -104,9 +107,9 @@ MATLAB PDSCH 解扰、速率恢复、LDPC 和 CRC 流程，绘制各 MCS/RB/SNR 
 
 ```bash
 python export_constellation.py --data dataset_h5 \
-  --checkpoint runs/no_csi/best.pt \
-  --splits runs/no_csi/splits.npz \
-  --config runs/no_csi/config.json \
+  --checkpoint runs/dmrs/best.pt \
+  --splits runs/dmrs/splits.npz \
+  --config runs/dmrs/config.json \
   --split test --output results/constellation.mat
 ```
 
@@ -116,8 +119,8 @@ python export_constellation.py --data dataset_h5 \
 
 ## 6. MATLAB 调用
 
-运行 `matlab/exampleCallNeuralRx.m`。示例将 MATLAB 的频域网格、噪声方差和
-调度信息写入临时 HDF5，调用 `infer.py`，再读取：
+运行 `matlab/exampleCallNeuralRx.m`。示例将 MATLAB 的频域网格、已知 DM-RS 参考及掩码、
+噪声方差和调度信息写入临时 HDF5，调用 `infer.py`，再读取：
 
 - `equalized_symbols`：神经接收机均衡星座；
 - `bit_llr_positive_one`：软 bit，正值表示 bit 1；

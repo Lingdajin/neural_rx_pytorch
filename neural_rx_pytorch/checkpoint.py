@@ -30,8 +30,8 @@ def load_model_checkpoint(
 def check_model_architecture(checkpoint: dict[str, Any], model: nn.Module) -> None:
     if checkpoint.get("model_architecture") != model.architecture:
         raise ValueError(
-            "Checkpoint architecture is incompatible with the receiver without channel "
-            "estimates/LMMSE. Train a new model in a new output directory; old "
+            f"Checkpoint architecture {checkpoint.get('model_architecture')!r} is incompatible "
+            f"with {model.architecture!r} (known DM-RS inputs). Train a new model in a new output directory; old "
             "checkpoints cannot be resumed or used for inference."
         )
 

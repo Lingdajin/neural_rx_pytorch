@@ -18,6 +18,8 @@ from torch.utils.data import Dataset
 ARRAY_FIELDS = {
     "rx_grid": 5,
     "data_mask": 4,
+    "dmrs_grid": 5,
+    "dmrs_mask": 4,
     "tx_symbols": 5,
     "coded_bits": 5,
     "traditional_eq": 5,
@@ -105,7 +107,7 @@ class MatlabH5Dataset(Dataset[dict[str, Tensor]]):
                 axis_order = _text_attr(handle.attrs.get("axis_order", "matlab")).lower()
                 if axis_order not in {"matlab", "python"}:
                     raise ValueError(f"{path}: axis_order must be 'matlab' or 'python'.")
-                required = {"rx_grid", "data_mask", *METADATA_FIELDS}
+                required = {"rx_grid", "data_mask", "dmrs_grid", "dmrs_mask", *METADATA_FIELDS}
                 if require_targets:
                     required.update({"tx_symbols", "coded_bits"})
                 missing = sorted(required.difference(handle.keys()))
@@ -125,6 +127,12 @@ class MatlabH5Dataset(Dataset[dict[str, Tensor]]):
                 mask_shape = _logical_shape(handle["data_mask"], axis_order)
                 if mask_shape != (count, num_symbols, max_subcarriers, 2):
                     raise ValueError(f"{path}: data_mask has invalid logical shape {mask_shape}.")
+                for name, expected in (
+                    ("dmrs_grid", (*mask_shape, 2)), ("dmrs_mask", mask_shape)
+                ):
+                    shape = _logical_shape(handle[name], axis_order)
+                    if shape != expected:
+                        raise ValueError(f"{path}: {name} has logical shape {shape}, expected {expected}.")
                 if require_targets:
                     symbol_shape = _logical_shape(handle["tx_symbols"], axis_order)
                     bit_shape = _logical_shape(handle["coded_bits"], axis_order)
@@ -226,7 +234,7 @@ class MatlabH5Dataset(Dataset[dict[str, Tensor]]):
         num_subcarriers = int(self.metadata["num_rbs"][index]) * 12
 
         result: dict[str, Tensor] = {}
-        names = ["rx_grid", "data_mask"]
+        names = ["rx_grid", "data_mask", "dmrs_grid", "dmrs_mask"]
         if self.require_targets:
             names.extend(("tx_symbols", "coded_bits"))
         if self.has_traditional_eq:
@@ -234,10 +242,26 @@ class MatlabH5Dataset(Dataset[dict[str, Tensor]]):
         for name in names:
             value = self._read_array(handle[name], local_index, shard.axis_order)
             value = np.ascontiguousarray(value[:, :num_subcarriers])
-            if name == "data_mask":
+            if name == "dmrs_mask" and not np.all((value == 0) | (value == 1)):
+                raise ValueError(f"{shard.path}: sample {local_index}: dmrs_mask must be binary.")
+            if name in {"data_mask", "dmrs_mask"}:
                 result[name] = torch.from_numpy(value.astype(np.bool_))
             else:
                 result[name] = torch.from_numpy(value.astype(np.float32))
+
+        pilot = result["dmrs_grid"].numpy()
+        pilot_mask = result["dmrs_mask"].numpy()
+        prefix = f"{shard.path}: sample {local_index}: "
+        if not np.isfinite(pilot).all():
+            raise ValueError(prefix + "dmrs_grid must be finite.")
+        if not pilot_mask.any(axis=(0, 1)).all():
+            raise ValueError(prefix + "each layer must contain known DM-RS.")
+        if np.any(pilot_mask & result["data_mask"].numpy()):
+            raise ValueError(prefix + "dmrs_mask overlaps data_mask on the same layer.")
+        if np.any(pilot[~pilot_mask] != 0):
+            raise ValueError(prefix + "dmrs_grid must be zero outside dmrs_mask.")
+        if np.any(np.sum(pilot[pilot_mask].astype(np.float64) ** 2, axis=-1) == 0):
+            raise ValueError(prefix + "dmrs_grid must be nonzero on dmrs_mask.")
 
         bit_width = result.get("coded_bits", torch.empty(0)).shape[-1]
         if self.require_targets and bit_width < self.max_bits_per_symbol:

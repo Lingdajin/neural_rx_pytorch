@@ -16,6 +16,8 @@ axes automatically.
 | `rx_grid` | `[N,S,K,2,2]` | `single` | Received grid; last axes are RX antenna and `[real,imag]` |
 | `channel_est` | `[N,S,K,2,2,2]` | `single` | Legacy field, ignored by the current loader and receiver |
 | `data_mask` | `[N,S,K,2]` | `uint8` | One on PDSCH data REs for each layer; zero on DM-RS/PTRS/padding |
+| `dmrs_grid` | `[N,S,K,2,2]` | `single` | Required known transmitted per-layer DM-RS IQ, zero off pilot mask |
+| `dmrs_mask` | `[N,S,K,2]` | `uint8` | Required binary per-layer pilot mask, disjoint from same-layer data mask |
 | `tx_symbols` | `[N,S,K,2,2]` | `single` | Transmitted layer-mapped QAM symbols and `[real,imag]` |
 | `coded_bits` | `[N,S,K,2,Qmax]` | `single` | Rate-matched/scrambled bits in mapper order, padded with zeros |
 | `traditional_eq` | `[N,S,K,2,2]` | `single` | Optional offline evaluation baseline; never read in training |
@@ -41,21 +43,29 @@ PDSCH receive chain. The model output uses the convention **positive LLR/logit
 means bit 1**; negate it if the downstream MATLAB decoder expects positive for
 bit 0.
 
-The current model does not require or read `channel_est`. Existing shards need
-no conversion: the field may remain on disk. `traditional_eq`, when present,
+The current model does not require or read `channel_est`; that field may remain
+on disk. Shards must include both new DM-RS fields. `traditional_eq`, when present,
 should contain the conventional receiver output in the same data RE ordering.
 Only evaluation/export/audit explicitly request it. Without it there is no
 traditional EVM or constellation; no LMMSE fallback is computed.
 
-Training reads `rx_grid`, `data_mask`, `tx_symbols`, `coded_bits`, the five required
+Training reads `rx_grid`, `dmrs_grid`, `dmrs_mask`, `data_mask`, `tx_symbols`, `coded_bits`, the five required
 metadata vectors, and optional `snr_db` for stratification/reporting. Inference
 does not read targets. Metadata and shape information are inspected at startup;
 large arrays are loaded sample by sample.
 
 Preserve received pilot REs in `rx_grid`, even where `data_mask=0`. The mask
-selects data targets, not which received REs the CNN may observe. This format
-does not supply a known transmitted DM-RS grid or a dedicated pilot mask; blind
-phase/layer ambiguity remains a limitation for unknown changing channels.
+selects data targets, not which received REs the CNN may observe. Each sample
+must contain nonzero finite pilot references on both layers; references outside
+the pilot mask must be zero. Masks must be binary. The loader rejects missing
+or malformed references, rather than silently reverting to blind detection.
+
+DM-RS references must include the exact sequence, port/OCC, placement and power
+scaling used for this received slot, in the same effective-layer convention as
+the targets. They remain in transmit scale, not divided by received RMS.
+The two layer masks may overlap (CDM); same-layer data/pilot overlap is rejected.
+Shape, support and global rank checks alone do not establish physical alignment.
+Updating shards changes their fingerprint: create new splits for the DM-RS run.
 
 ## Collection recommendations
 

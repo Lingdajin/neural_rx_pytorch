@@ -76,13 +76,13 @@ class ReceiverIteration(nn.Module):
 class NeuralPDSCHReceiver(nn.Module):
     """Fully convolutional receiver shared across MCS and RB allocations.
 
-    Uses received IQ, masks, noise power and scheduling conditions, without
+    Uses received IQ, known transmitted DM-RS, masks, noise and conditions, without
     channel estimates or a classical equalizer. Layer identities break the
     symmetry of shared graph blocks. Symbols are predicted directly in the
     transmitter's QAM scale. Positive bit logits mean bit one.
     """
 
-    architecture = "pdsch_no_csi_v1"
+    architecture = "pdsch_dmrs_v1"
 
     def __init__(
         self,
@@ -109,10 +109,12 @@ class NeuralPDSCHReceiver(nn.Module):
             nn.SiLU(),
         )
         self.register_buffer("layer_identity", torch.eye(num_layers))
-        # Per layer: all RX samples, one-hot layer identity, RE mask,
+        # Per layer: all RX samples, ALL layers' known pilot IQ and masks,
+        # one-hot layer identity, RE mask,
         # log noise, and the MCS/RB condition. The identity is not channel CSI.
         evidence_channels = (
             2 * num_rx_antennas
+            + 3 * num_layers
             + num_layers
             + 1
             + 1
@@ -157,9 +159,13 @@ class NeuralPDSCHReceiver(nn.Module):
         qm: Tensor,
         code_rate: Tensor,
         num_rbs: Tensor,
+        dmrs_grid: Tensor,
+        dmrs_mask: Tensor,
     ) -> dict[str, Tensor]:
         if data_mask.shape[-1] != self.num_layers:
             raise ValueError("data_mask must have one mask plane per layer.")
+        if dmrs_grid.shape != (*data_mask.shape, 2) or dmrs_mask.shape != data_mask.shape:
+            raise ValueError("dmrs_grid must be [B,S,K,L,2] and dmrs_mask [B,S,K,L].")
         rx_grid, normalized_n0 = self._normalize(
             rx_grid, noise_var, data_mask
         )
@@ -169,6 +175,15 @@ class NeuralPDSCHReceiver(nn.Module):
             batch, 2 * self.num_rx_antennas, symbols, subcarriers
         )
         rx_features = rx_features[:, None].expand(-1, self.num_layers, -1, -1, -1)
+        # Reference symbols stay in the transmitter's scale, like tx_symbols.
+        # Do not divide them by the received RMS or remove received pilot REs.
+        pilots = dmrs_grid.to(rx_grid.dtype).masked_fill(~dmrs_mask.bool()[..., None], 0)
+        pilot_iq = pilots.permute(0, 3, 4, 1, 2).reshape(
+            batch, 2 * self.num_layers, symbols, subcarriers
+        )
+        pilot_masks = dmrs_mask.permute(0, 3, 1, 2).to(rx_grid.dtype)
+        pilot_features = torch.cat((pilot_iq, pilot_masks), dim=1)
+        pilot_features = pilot_features[:, None].expand(-1, self.num_layers, -1, -1, -1)
         layer_features = self.layer_identity.to(rx_features.dtype)[None, :, :, None, None].expand(
             batch, -1, -1, symbols, subcarriers
         )
@@ -189,7 +204,7 @@ class NeuralPDSCHReceiver(nn.Module):
             -1, self.num_layers, -1, symbols, subcarriers
         )
         evidence = torch.cat(
-            (rx_features, layer_features, mask_features, log_n0, conditions),
+            (rx_features, pilot_features, layer_features, mask_features, log_n0, conditions),
             dim=2,
         )
         flat_evidence = evidence.reshape(

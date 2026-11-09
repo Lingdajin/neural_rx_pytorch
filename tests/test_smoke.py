@@ -15,7 +15,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from neural_rx_pytorch.data import MatlabH5Dataset, padded_collate
-from neural_rx_pytorch.engine import MODEL_INPUTS, run_epoch
+from neural_rx_pytorch.engine import MODEL_INPUTS, ablate_dmrs, run_epoch
 from neural_rx_pytorch.checkpoint import check_model_architecture
 from neural_rx_pytorch.losses import ReceiverLoss
 from neural_rx_pytorch.metrics import masked_ber
@@ -35,8 +35,16 @@ def create_dataset(path: Path, axis_order: str = "python") -> None:
     bits = rng.integers(0, 2, size=(count, symbols, subcarriers, 2, 4)).astype(np.float32)
     mask = np.ones((count, symbols, subcarriers, 2), np.uint8)
     num_rbs = np.tile(np.asarray([1, 2], np.int64), count // 2)
+    pilot_mask = np.zeros_like(mask)
+    pilot_mask[:, 0, ::2, :] = 1
+    mask[:, 0, ::2, :] = 0
+    pilot = np.zeros_like(tx)
+    pilot[:, 0, ::2, 0, 0] = 1.0
+    pilot[:, 0, ::2, 1, 0] = np.tile([1.0, -1.0], subcarriers // 4)
     for index, rbs in enumerate(num_rbs):
         mask[index, :, 12 * rbs :] = 0
+        pilot_mask[index, :, 12 * rbs :] = 0
+        pilot[index, :, 12 * rbs :] = 0
     qm = np.tile(np.asarray([2, 4], np.int64), count // 2)
 
     def stored(value: np.ndarray) -> np.ndarray:
@@ -49,6 +57,8 @@ def create_dataset(path: Path, axis_order: str = "python") -> None:
         handle.create_dataset("rx_grid", data=stored(rx))
         handle.create_dataset("channel_est", data=stored(channel))
         handle.create_dataset("data_mask", data=stored(mask))
+        handle.create_dataset("dmrs_grid", data=stored(pilot))
+        handle.create_dataset("dmrs_mask", data=stored(pilot_mask))
         handle.create_dataset("tx_symbols", data=stored(tx))
         handle.create_dataset("coded_bits", data=stored(bits))
         handle.create_dataset("mcs_index", data=stored(qm))
@@ -63,6 +73,73 @@ def create_dataset(path: Path, axis_order: str = "python") -> None:
 
 
 class ReceiverSmokeTest(unittest.TestCase):
+    def test_dmrs_validation(self) -> None:
+        for corruption, message in (
+            ("missing", "missing datasets"), ("shape", "logical shape"),
+            ("nonbinary", "binary"), ("empty", "each layer"),
+            ("overlap", "overlaps"), ("outside", "outside"),
+            ("nan", "finite"), ("zero_pilot", "nonzero"),
+        ):
+            with self.subTest(corruption=corruption), tempfile.TemporaryDirectory() as temporary:
+                path = Path(temporary) / "sample.h5"
+                create_dataset(path)
+                with h5py.File(path, "a") as f:
+                    if corruption == "missing":
+                        del f["dmrs_grid"]
+                    elif corruption == "shape":
+                        del f["dmrs_mask"]
+                        f.create_dataset("dmrs_mask", data=np.zeros((12, 4, 24, 1)))
+                    elif corruption == "nonbinary":
+                        f["dmrs_mask"][0, 0, 0, 0] = 2
+                    elif corruption == "empty":
+                        f["dmrs_mask"][0] = 0
+                    elif corruption == "overlap":
+                        f["data_mask"][0, 0, 0, 0] = 1
+                    elif corruption == "outside":
+                        f["dmrs_grid"][0, 1, 0, 0, 0] = 1
+                    elif corruption == "nan":
+                        f["dmrs_grid"][0, 0, 0, 0, 0] = np.nan
+                    elif corruption == "zero_pilot":
+                        f["dmrs_grid"][0, 0, 0, 0] = 0
+                with self.assertRaisesRegex((ValueError, KeyError), message):
+                    dataset = MatlabH5Dataset(path, max_bits_per_symbol=4)
+                    try:
+                        dataset[0]
+                    finally:
+                        dataset.close()
+
+    def test_pilot_path_and_controls(self) -> None:
+        torch.manual_seed(42)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "sample.h5"
+            create_dataset(path)
+            dataset = MatlabH5Dataset(path, max_bits_per_symbol=4)
+            try:
+                batch = padded_collate([dataset[0], dataset[1]])
+            finally:
+                dataset.close()
+        self.assertFalse(batch["dmrs_mask"][0, :, 12:].any())
+        self.assertTrue((batch["dmrs_grid"][0, :, 12:] == 0).all())
+        model = NeuralPDSCHReceiver(hidden_channels=8, condition_channels=4,
+                                    num_iterations=1, max_bits_per_symbol=4).eval()
+        original = batch["dmrs_grid"].clone()
+        batch["dmrs_grid"].requires_grad_()
+        outputs = model(*(batch[name] for name in MODEL_INPUTS))
+        ReceiverLoss()(outputs, batch)["loss"].backward()
+        grad = batch["dmrs_grid"].grad
+        self.assertTrue(torch.isfinite(grad).all())
+        for layer in range(2):
+            self.assertGreater(float(grad[..., layer, :].abs().sum()), 0)
+        self.assertTrue((grad[~batch["dmrs_mask"]] == 0).all())
+        for mode in ("zero", "phase_rotate"):
+            changed = ablate_dmrs(batch, mode)
+            predicted = model(*(changed[name] for name in MODEL_INPUTS))
+            self.assertFalse(torch.allclose(outputs["bit_logits"], predicted["bit_logits"]))
+            torch.testing.assert_close(batch["dmrs_grid"], original)
+            self.assertIs(changed["rx_grid"], batch["rx_grid"])
+        with self.assertRaisesRegex(ValueError, "pdsch_dmrs_v1"):
+            check_model_architecture({"model_architecture": "pdsch_no_csi_v1"}, model)
+
     def test_selective_loading_and_channel_free_backward(self) -> None:
         for axis_order in ("python", "matlab"):
             with self.subTest(axis_order=axis_order), tempfile.TemporaryDirectory() as temporary:
@@ -88,6 +165,8 @@ class ReceiverSmokeTest(unittest.TestCase):
                         dataset.close()
                 self.assertNotIn("/channel_est", read_names)
                 self.assertNotIn("/traditional_eq", read_names)
+                self.assertIn("/dmrs_grid", read_names)
+                self.assertIn("/dmrs_mask", read_names)
                 self.assertNotIn("channel_est", batch)
                 self.assertNotIn("traditional_eq", batch)
                 model = NeuralPDSCHReceiver(
@@ -142,10 +221,7 @@ class ReceiverSmokeTest(unittest.TestCase):
                     num_iterations=2,
                     max_num_rbs=2,
                 )
-                outputs = model(
-                    batch["rx_grid"], batch["noise_var"],
-                    batch["data_mask"], batch["qm"], batch["code_rate"], batch["num_rbs"],
-                )
+                outputs = model(*(batch[name] for name in MODEL_INPUTS))
                 self.assertEqual(outputs["bit_logits"].shape, (4, 4, 24, 2, 4))
                 self.assertEqual(outputs["equalized_symbols"].shape, (4, 4, 24, 2, 2))
                 loss = ReceiverLoss()(outputs, batch)["loss"]
@@ -179,7 +255,7 @@ class ReceiverSmokeTest(unittest.TestCase):
                 for index in (0, 1, len(python_data) - 1):
                     left = python_data[index]
                     right = matlab_data[index]
-                    for name in ("rx_grid", "data_mask", "tx_symbols", "coded_bits"):
+                    for name in ("rx_grid", "data_mask", "dmrs_grid", "dmrs_mask", "tx_symbols", "coded_bits"):
                         torch.testing.assert_close(left[name], right[name])
             finally:
                 python_data.close()
@@ -260,6 +336,11 @@ class ReceiverSmokeTest(unittest.TestCase):
             self.assertEqual("traditional_evm" in summary["metrics"], with_baseline)
             if with_baseline:
                 self.assertEqual(summary["metrics"]["traditional_evm"], 0.0)
+            self.assertEqual(summary["dmrs_mode"], "correct")
+            with patch.object(sys, "argv", validation_args + ["--dmrs-mode", "phase_rotate"]):
+                validate.main()
+            rotated = json.loads((validation_dir / "summary.json").read_text())
+            self.assertEqual(rotated["dmrs_mode"], "phase_rotate")
 
             constellation_path = root / "constellation.mat"
             export_args = [

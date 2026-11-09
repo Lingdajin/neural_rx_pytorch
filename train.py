@@ -34,7 +34,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data", nargs="+", default=[str(ROOT / "dataset_h5")],
                         help="HDF5 files, glob, or directory (default: dataset_h5)")
     parser.add_argument("--config", default=str(ROOT / "config" / "default_2x2.json"))
-    parser.add_argument("--output-dir", default=str(ROOT / "runs" / "no_csi"))
+    parser.add_argument("--output-dir", default=str(ROOT / "runs" / "dmrs"))
     parser.add_argument("--resume", default=None, help="Checkpoint to resume, usually last.pt")
     parser.add_argument("--device", default="cuda", choices=("cuda", "cpu"))
     parser.add_argument("--epochs", type=int, default=None)

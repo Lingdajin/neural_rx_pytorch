@@ -4,6 +4,8 @@ function writeNeuralRxH5(filename, data)
 % Required fields (logical MATLAB dimensions):
 %   rxGrid       [N,S,K,2] complex
 %   dataMask     [N,S,K,2] logical
+%   dmrsGrid     [N,S,K,2] complex, known transmitted pilots, zero elsewhere
+%   dmrsMask     [N,S,K,2] logical, same layer/port convention as txSymbols
 %   mcsIndex     [N,1], qm [N,1], codeRate [N,1]
 %   numRBs       [N,1], noiseVar [N,1]
 % Optional metadata: snrDb [N,1]
@@ -25,11 +27,13 @@ if isfile(filename)
 end
 writeReal(filename, '/rx_grid', complexToIQ(data.rxGrid));
 h5writeatt(filename, '/', 'axis_order', 'matlab');
-h5writeatt(filename, '/', 'format_version', int32(1));
+h5writeatt(filename, '/', 'format_version', int32(2));
 if isfield(data, 'channelEst')
     writeReal(filename, '/channel_est', complexToIQ(data.channelEst));
 end
 writeReal(filename, '/data_mask', uint8(data.dataMask));
+writeReal(filename, '/dmrs_grid', complexToIQ(data.dmrsGrid));
+writeReal(filename, '/dmrs_mask', uint8(data.dmrsMask));
 
 requiredMetadata = {'mcsIndex','qm','codeRate','numRBs','noiseVar'};
 storedNames = {'mcs_index','qm','code_rate','num_rbs','noise_var'};
